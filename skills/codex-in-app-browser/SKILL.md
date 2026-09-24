@@ -1,51 +1,42 @@
 ---
 name: codex-in-app-browser
-description: Drive the Codex in-app browser (open, navigate, click, type, screenshot, read page state) through the app's own node_repl runtime. Use when the session uses a custom (non-OpenAI) model, for example deepseek-v4-flash or mimo-v2.5, and the user asks to use the in-app browser, open or navigate a page in it, test a local app in a browser, or click, type, or take a screenshot in the Codex browser panel.
+description: Operate browser tabs through the current Codex browser tool. Use when a custom (non-OpenAI) model through Codex Router needs to open, read, fill, click, or test pages in the Codex in-app browser.
 ---
 
 # Codex In-App Browser
 
-The tool is `mcp__node_repl__js`. It is available in this session.
+Check the current callable tool definitions. The current browser entry point
+is CUA JS, usually flattened as `mcp__cua_repl__js` on routed models. A skill
+or inherited parent message does not prove the tool is available to a child.
 
-## First: read the official skill
-
-The official skill is authoritative. Read it before any browser work:
-
-`~/.codex/plugins/cache/openai-bundled/browser/<version>/skills/control-in-app-browser/SKILL.md`
-
-Find the latest `<version>` directory (for example `26.803.41515`).
-
-## Bootstrap (once per session)
-
-Send this as ONE line through `mcp__node_repl__js`:
+Use the entry point specified by the live tool instructions. For an initial
+browser inventory, the first call contains only:
 
 ```js
-if (globalThis.agent?.browsers == null) { const { setupBrowserRuntime } = await import("<plugin root>/scripts/browser-client.mjs"); globalThis.agent = await setupBrowserRuntime(); }
+await cua.getState();
 ```
 
-Replace `<plugin root>` with the browser plugin path. Then bind the
-in-app browser and read its documentation:
+Read the returned documentation before proceeding. For a known URL and an
+explicit request for the in-app browser, its entry point is:
 
 ```js
-globalThis.iab = await agent.browsers.get("iab");
-nodeRepl.write(await iab.documentation());
+let tab = await cua.createBrowserTab("iab", url, { visible: true });
 ```
 
-Read the complete documentation output before interacting with the page.
+For a child agent, use `{ visible: false }`: the CUA service rejects visible
+in-app tabs in subagent threads. The child can still control its hidden tab
+independently.
 
-## Rules
+Follow the user's browser choice and the live entry-point precedence for tab
+mentions and other browsers. Use only the APIs documented by the current tool.
+After actions, read the updated accessibility state before choosing the next
+action, and verify entered values and final outcomes from the returned state.
 
-- Send code as ONE line, or use `@file:<path>` with a trailing newline.
-  The runtime fires on newline; input without a trailing newline silently
-  does nothing.
-- Reuse the existing `agent` and `iab` bindings on later turns. Do not
-  reinitialize.
-- `open_in_codex` only OPENS a tab. It cannot click, type, or read. Use
-  `mcp__node_repl__js` for interaction.
-- Never start your own node_repl process and never write a side-channel
-  driver. Use the tool you were given.
+Do not bootstrap `node_repl`, import a browser client, or start a side-channel
+driver for CUA. Legacy runtime instructions apply only when that legacy tool
+is actually declared and its current documentation requires them.
 
-## If the tool is missing
-
-Stop and report that `mcp__node_repl__js` is not in the tool list. Do not
-build workarounds.
+If the tool is absent or returns `unsupported call`, stop and report the exact
+blocker. Do not guess tool names or investigate alternative runtimes. A parent
+executing a child's proposed browser actions is assisted operation, not
+independent child browser control.

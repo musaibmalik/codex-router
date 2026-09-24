@@ -8,7 +8,7 @@
       "provider": "grok-oauth",
       "listed": true,
       "multiAgentVersion": "v2",
-      "displayName": "Grok 4.5 (OAuth)",
+      "displayName": "Grok 4.5",
       "description": "Grok 4.5 through the official Grok CLI OAuth session with agentic coding, tool calls, and hosted web/X search.",
       "priority": 2,
       "defaultEffort": "high",

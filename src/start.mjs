@@ -1,3 +1,4 @@
+import { waitForCustomModelRefresh } from "./custom-model-monitor.mjs";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -283,9 +284,12 @@ function waitForHealth(label, url, headers = {}, timeoutMs = 30_000, expectedSer
 // drift apart; the margin covers the exit itself.
 const SIGKILL_AFTER_MS = SHUTDOWN_DRAIN_MS + SHUTDOWN_FLUSH_MS + 2_000;
 
+const customModelMonitorAbort = new AbortController();
+
 function stopChildren() {
   if (shuttingDown) return;
   shuttingDown = true;
+  customModelMonitorAbort.abort();
   for (const child of children) {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
   }
@@ -464,6 +468,7 @@ async function main() {
   // (issue #261, a 429 raised out of LiteLLM's exception mapping), and taking
   // the router down with it turned one failed request into a dead session.
   const result = await Promise.race([
+    waitForCustomModelRefresh({ isStopping: () => shuttingDown, signal: customModelMonitorAbort.signal }),
     waitForExit(kimiForwarder, "OAuth forwarder"),
     waitForExit(api, "API forwarder"),
     waitForExit(grokForwarder, "Grok OAuth forwarder"),

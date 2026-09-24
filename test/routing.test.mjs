@@ -853,7 +853,7 @@ test("a routed Grok 502 terminates a streamed turn with one SSE error", async ()
     const event = JSON.parse(eventData.slice(5).trim());
     assert.equal(event.type, "error");
     assert.equal(event.code, "server_error");
-    assert.match(event.message, /Grok 4\.6 \(OAuth\).*unavailable/);
+    assert.match(event.message, /Grok 4\.6(?: \(OAuth\))?.*unavailable/);
     assert.match(event.message, /HTTP 502/);
     assert.doesNotMatch(event.message, /litellm/i);
     assert.doesNotMatch(body, /response\.completed/);
@@ -3145,6 +3145,101 @@ function curatedGeminiModel() {
   return { dir, file, gatewayModel: "gemini-api-gemini-3-5-flash" };
 }
 
+function curatedGoogleToolSchemaModel(baseUrl) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "routing-google-schema-models-"));
+  const file = path.join(dir, "user-models.json");
+  writeFileSync(
+    file,
+    JSON.stringify({
+      version: 1,
+      models: [
+        {
+          slug: "custom/vertex-claude-test",
+          gatewayModel: "vertex-claude-test",
+          upstreamModel: "claude-sonnet-test",
+          provider: "custom",
+          listed: true,
+          displayName: "Claude Vertex Schema Test",
+          description: "Non-Gemini model using Google's strict tool schema transport.",
+          priority: 500,
+          defaultEffort: "high",
+          reasoningLevels: [{ effort: "high", description: "Adaptive reasoning" }],
+          contextWindow: 131072,
+          autoCompact: 110000,
+          inputModalities: ["text"],
+          compHash: "vertex-claude-test-user-v1",
+          usesGoogleToolSchema: true,
+          endpoint: {
+            baseUrl,
+            credential: {
+              file: "vertex-schema-test.api-key",
+              environment: ["VERTEX_SCHEMA_TEST_API_KEY"],
+            },
+            note: "Loopback test endpoint.",
+          },
+        },
+        {
+          slug: "custom/antigravity-gpt-oss-test",
+          gatewayModel: "antigravity-gpt-oss-test",
+          upstreamModel: "gpt-oss-120b-medium",
+          provider: "custom",
+          listed: true,
+          displayName: "GPT OSS Antigravity Schema Test",
+          description: "Non-Gemini Antigravity model using Google's strict tool schema transport.",
+          priority: 501,
+          defaultEffort: "medium",
+          reasoningLevels: [{ effort: "medium", description: "Medium reasoning" }],
+          contextWindow: 131072,
+          autoCompact: 110000,
+          inputModalities: ["text"],
+          compHash: "antigravity-gpt-oss-test-user-v1",
+          usesGoogleToolSchema: true,
+          endpoint: {
+            baseUrl,
+            credential: {
+              file: "vertex-schema-test.api-key",
+              environment: ["VERTEX_SCHEMA_TEST_API_KEY"],
+            },
+            note: "Loopback test endpoint.",
+          },
+        },
+        {
+          slug: "custom/plain-claude-test",
+          gatewayModel: "plain-claude-test",
+          upstreamModel: "claude-sonnet-plain-test",
+          provider: "custom",
+          listed: true,
+          displayName: "Claude Plain Schema Test",
+          description: "Control fixture without Google tool-schema normalization.",
+          priority: 502,
+          defaultEffort: "high",
+          reasoningLevels: [{ effort: "high", description: "Adaptive reasoning" }],
+          contextWindow: 131072,
+          autoCompact: 110000,
+          inputModalities: ["text"],
+          compHash: "plain-claude-test-user-v1",
+          endpoint: {
+            baseUrl,
+            credential: {
+              file: "vertex-schema-test.api-key",
+              environment: ["VERTEX_SCHEMA_TEST_API_KEY"],
+            },
+            note: "Loopback test endpoint.",
+          },
+        },
+      ],
+    }),
+    "utf8",
+  );
+  return {
+    dir,
+    file,
+    gatewayModel: "vertex-claude-test",
+    gptOssGatewayModel: "antigravity-gpt-oss-test",
+    plainGatewayModel: "plain-claude-test",
+  };
+}
+
 function curatedCopilotModel() {
   const dir = mkdtempSync(path.join(os.tmpdir(), "routing-copilot-models-"));
   const file = path.join(dir, "user-models.json");
@@ -3426,6 +3521,81 @@ test("API forwarder fills only missing Gemini thought signatures", async () => {
         think: true,
         store: true,
         logit_bias: { 123: -100 },
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "lookup",
+              parameters: {
+                type: "object",
+                properties: {
+                  path: { type: "string", encrypted: true },
+                  malformed: {
+                    type: "object",
+                    properties: {
+                      type: "object",
+                      description: 'See: {"type":"string"}',
+                    },
+                  },
+                  encrypted: { type: "boolean" },
+                  emptyEnum: { type: ["string", "null"], enum: ["ready", "", null] },
+                  scalarWithProperties: {
+                    type: "string",
+                    properties: { label: { type: "string" } },
+                    required: ["label"],
+                    additionalProperties: false,
+                  },
+                  composedArray: {
+                    type: "array",
+                    items: {
+                      allOf: [
+                        {
+                          type: "object",
+                          properties: { annotations: { type: "object" } },
+                        },
+                        {
+                          anyOf: [
+                            { type: "object", properties: { text: { type: "string" } } },
+                            { type: "object", properties: { mention: { type: "string" } } },
+                          ],
+                        },
+                      ],
+                    },
+                  },
+                  refContainer: {
+                    type: "object",
+                    properties: { $ref: { type: "string" } },
+                    required: ["$ref"],
+                    additionalProperties: false,
+                  },
+                },
+              },
+            },
+          },
+          {
+            type: "function",
+            function: {
+              name: "deferred_lookup",
+              parameters: JSON.stringify({
+                type: "object",
+                properties: {
+                  request: {
+                    type: "object",
+                    properties: {
+                      output: {
+                        type: "object",
+                        properties: {
+                          type: "object",
+                          description: 'See: {"type":"string"}',
+                        },
+                      },
+                    },
+                  },
+                },
+              }),
+            },
+          },
+        ],
         messages: [
           {
             role: "user",
@@ -3469,6 +3639,29 @@ test("API forwarder fills only missing Gemini thought signatures", async () => {
     assert.equal(body.think, undefined);
     assert.equal(body.store, undefined);
     assert.equal(body.logit_bias, undefined);
+    const parameters = body.tools[0].function.parameters;
+    assert.deepEqual(parameters.properties.path, { type: "string" });
+    assert.deepEqual(parameters.properties.malformed.properties, {
+      type: {},
+      description: {},
+    });
+    assert.deepEqual(
+      parameters.properties.encrypted,
+      { type: "boolean" },
+      "an argument named encrypted is valid; only schema metadata is stripped",
+    );
+    assert.deepEqual(parameters.properties.emptyEnum.enum, ["ready"]);
+    assert.deepEqual(parameters.properties.scalarWithProperties, { type: "string" });
+    assert.equal(parameters.properties.composedArray.items.type, "object");
+    assert.deepEqual(parameters.properties.refContainer.properties, {});
+    assert.equal(parameters.properties.refContainer.required, undefined);
+    assert.equal(parameters.properties.refContainer.additionalProperties, true);
+    const deferred = body.tools[1].function.parameters;
+    assert.equal(typeof deferred, "object", "serialized deferred-tool schemas are normalized");
+    assert.deepEqual(deferred.properties.request.properties.output.properties, {
+      type: {},
+      description: {},
+    });
     // Google accepts images only on user turns: the user image survives, the
     // tool-turn image is downgraded to a text placeholder.
     const userMsg = body.messages.find((message) => message.role === "user");
@@ -3493,6 +3686,337 @@ test("API forwarder fills only missing Gemini thought signatures", async () => {
       bare.extra_content.google.thought_signature,
       "skip_thought_signature_validator",
     );
+  } finally {
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+    rmSync(curated.dir, { recursive: true, force: true });
+  }
+});
+
+test("API forwarder sanitizes Google tool schemas for an opted-in non-Gemini model", async () => {
+  const upstreamRequests = [];
+  const upstream = await mockServer(async (request, response) => {
+    upstreamRequests.push(await bodyJson(request));
+    json(response, 200, { choices: [] });
+  });
+  const curated = curatedGoogleToolSchemaModel(`http://127.0.0.1:${upstream.port}/v1`);
+  const forwarderPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+    MODEL_ROUTER_USER_MODELS: curated.file,
+    VERTEX_SCHEMA_TEST_API_KEY: "TEST_VERTEX_SCHEMA_API_KEY",
+    KIMI_PROXY_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    const response = await fetch(`http://127.0.0.1:${forwarderPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${INTERNAL_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: curated.gatewayModel,
+        web_search_options: { search_context_size: "medium" },
+        thinking: { type: "enabled" },
+        think: true,
+        store: true,
+        logit_bias: { 123: -100 },
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "lookup",
+              parameters: {
+                type: "object",
+                properties: {
+                  path: { type: "string", encrypted: true },
+                  encrypted: { type: "boolean" },
+                  malformed: {
+                    type: "object",
+                    properties: {
+                      type: "object",
+                      description: '{"type":"string"}',
+                    },
+                  },
+                  scalarWithProperties: {
+                    type: "string",
+                    properties: { label: { type: "string" } },
+                    required: ["label"],
+                    additionalProperties: false,
+                  },
+                },
+              },
+            },
+          },
+        ],
+        messages: [
+          { role: "user", content: "look this up" },
+          {
+            role: "assistant",
+            tool_calls: [
+              {
+                id: "call-bare",
+                type: "function",
+                function: { name: "lookup", arguments: "{}" },
+              },
+            ],
+          },
+          { role: "tool", tool_call_id: "call-bare", content: "ok" },
+        ],
+      }),
+    });
+    assert.equal(response.status, 200, forwarder.testErrors());
+    const body = upstreamRequests[0];
+    assert.equal(body.model, "claude-sonnet-test");
+    const parameters = body.tools[0].function.parameters;
+    assert.deepEqual(parameters.properties.path, { type: "string" });
+    assert.deepEqual(parameters.properties.encrypted, { type: "boolean" });
+    assert.deepEqual(parameters.properties.malformed.properties, {
+      type: {},
+      description: {},
+    });
+    assert.deepEqual(parameters.properties.scalarWithProperties, { type: "string" });
+
+    // Opting into Google's strict tool schema is deliberately narrower than
+    // pretending this Claude route is Gemini. Gemini-only request stripping
+    // and thought-signature injection must not run.
+    assert.deepEqual(body.web_search_options, { search_context_size: "medium" });
+    assert.deepEqual(body.thinking, { type: "enabled" });
+    assert.equal(body.think, true);
+    assert.equal(body.store, true);
+    assert.deepEqual(body.logit_bias, { 123: -100 });
+    const call = body.messages.find((message) => message.role === "assistant").tool_calls[0];
+    assert.equal(call.thought_signature, undefined);
+    assert.equal(call.extra_content, undefined);
+
+    const gptOssResponse = await fetch(
+      `http://127.0.0.1:${forwarderPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${INTERNAL_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: curated.gptOssGatewayModel,
+          tools: [
+            {
+              type: "function",
+              function: {
+                name: "lookup",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    path: { type: "string", encrypted: true },
+                    malformed: {
+                      type: "object",
+                      properties: {
+                        type: "object",
+                        description: '{"type":"string"}',
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          ],
+          messages: [{ role: "user", content: "look this up" }],
+        }),
+      },
+    );
+    assert.equal(gptOssResponse.status, 200, forwarder.testErrors());
+    assert.equal(upstreamRequests[1].model, "gpt-oss-120b-medium");
+    assert.deepEqual(upstreamRequests[1].tools[0].function.parameters.properties.path, {
+      type: "string",
+    });
+    assert.deepEqual(
+      upstreamRequests[1].tools[0].function.parameters.properties.malformed.properties,
+      { type: {}, description: {} },
+    );
+
+    const plainResponse = await fetch(
+      `http://127.0.0.1:${forwarderPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${INTERNAL_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: curated.plainGatewayModel,
+          tools: [
+            {
+              type: "function",
+              function: {
+                name: "lookup",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    path: { type: "string", encrypted: true },
+                    encrypted: { type: "boolean" },
+                  },
+                },
+              },
+            },
+          ],
+          messages: [{ role: "user", content: "look this up" }],
+        }),
+      },
+    );
+    assert.equal(plainResponse.status, 200, forwarder.testErrors());
+    assert.equal(upstreamRequests[2].model, "claude-sonnet-plain-test");
+    assert.deepEqual(upstreamRequests[2].tools[0].function.parameters.properties.path, {
+      type: "string",
+      encrypted: true,
+    });
+    assert.deepEqual(upstreamRequests[2].tools[0].function.parameters.properties.encrypted, {
+      type: "boolean",
+    });
+  } finally {
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+    rmSync(curated.dir, { recursive: true, force: true });
+  }
+});
+
+test("API forwarder preserves Google schema alternatives and literal argument names", async (t) => {
+  const upstreamRequests = [];
+  const upstream = await mockServer(async (request, response) => {
+    upstreamRequests.push(await bodyJson(request));
+    json(response, 200, { choices: [] });
+  });
+  const curated = curatedGoogleToolSchemaModel(`http://127.0.0.1:${upstream.port}/v1`);
+  const forwarderPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+    MODEL_ROUTER_USER_MODELS: curated.file,
+    VERTEX_SCHEMA_TEST_API_KEY: "TEST_VERTEX_SCHEMA_API_KEY",
+    CODEX_HOME: curated.dir,
+    KIMI_PROXY_QUIET: "1",
+  });
+  const fixtures = [
+    {
+      name: "mixed unions inside allOf retain their scalar alternatives",
+      parameters: {
+        type: "object",
+        properties: {
+          value: {
+            allOf: [{ anyOf: [{ type: "object" }, { type: "string" }] }],
+          },
+          exclusive: {
+            allOf: [{ oneOf: [{ type: "object" }, { type: "number" }] }],
+          },
+          scalar: {
+            allOf: [{ type: "string", properties: { label: { type: "string" } } }],
+          },
+          object: {
+            allOf: [{ anyOf: [{ type: "object" }, { type: "object" }] }],
+          },
+        },
+      },
+      verify(parameters) {
+        assert.equal(parameters.properties.value.type, undefined);
+        assert.equal(parameters.properties.exclusive.type, undefined);
+        assert.equal(parameters.properties.scalar.type, undefined);
+        assert.equal(parameters.properties.object.type, "object");
+      },
+    },
+    {
+      name: "a literal __proto__ argument survives schema-map repair",
+      parameters: {
+        type: "object",
+        properties: JSON.parse('{"__proto__":{"type":"string","encrypted":true},"path":{"type":"string","encrypted":true}}'),
+        required: ["__proto__"],
+        additionalProperties: false,
+      },
+      verify(parameters) {
+        assert.ok(Object.hasOwn(parameters.properties, "__proto__"));
+        assert.deepEqual(parameters.properties.__proto__, { type: "string" });
+        assert.deepEqual(parameters.properties.path, { type: "string" });
+        assert.deepEqual(parameters.required, ["__proto__"]);
+      },
+    },
+    {
+      name: "removed scalar object constraints are not restored by recursion",
+      parameters: {
+        type: "object",
+        properties: {
+          label: {
+            type: "string",
+            properties: { nested: { type: "string" } },
+            required: ["nested"],
+            additionalProperties: { type: "string", encrypted: true },
+          },
+        },
+      },
+      verify(parameters) {
+        assert.deepEqual(parameters.properties.label, { type: "string" });
+      },
+    },
+    {
+      name: "nested item schemas infer the array type required by Vertex",
+      parameters: {
+        type: "object",
+        properties: {
+          requests: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                instruments: { items: { type: "string" } },
+                fields: { items: { type: "string" } },
+              },
+            },
+          },
+        },
+      },
+      verify(parameters) {
+        const request = parameters.properties.requests.items;
+        assert.deepEqual(request.properties.instruments, {
+          type: "array",
+          items: { type: "string" },
+        });
+        assert.deepEqual(request.properties.fields, {
+          type: "array",
+          items: { type: "string" },
+        });
+      },
+    },
+  ];
+
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    for (const fixture of fixtures) {
+      await t.test(fixture.name, async () => {
+        for (const model of [curated.gptOssGatewayModel, curated.plainGatewayModel]) {
+          const response = await fetch(`http://127.0.0.1:${forwarderPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${INTERNAL_KEY}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              model,
+              tools: [{ type: "function", function: { name: "lookup", parameters: fixture.parameters } }],
+              messages: [{ role: "user", content: "look this up" }],
+            }),
+          });
+          assert.equal(response.status, 200, forwarder.testErrors());
+          const parameters = upstreamRequests.at(-1).tools[0].function.parameters;
+          if (model === curated.plainGatewayModel) {
+            assert.deepEqual(parameters, fixture.parameters, "unflagged custom schemas stay unchanged");
+          } else {
+            fixture.verify(parameters);
+          }
+        }
+      });
+    }
   } finally {
     await stopChild(forwarder);
     await closeServer(upstream.server);

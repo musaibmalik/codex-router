@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "slug": "grok-oauth/grok-4.7-fast",
+      "gatewayModel": "grok-oauth-grok-4-7-fast",
+      "upstreamModel": "grok-4.7-build-fast",
+      "provider": "grok-oauth",
+      "listed": true,
+      "multiAgentVersion": "v2",
+      "displayName": "Grok 4.7 Fast",
+      "description": "Grok 4.7 Fast variant through the official Grok CLI OAuth session.",
+      "priority": 0,
+      "defaultEffort": "high",
+      "reasoningLevels": [
+        {
+          "effort": "low",
+          "description": "Faster reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced reasoning"
+        },
+        {
+          "effort": "high",
+          "description": "Deep reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Maximum reasoning depth"
+        }
+      ],
+      "contextWindow": 500000,
+      "autoCompact": 440000,
+      "inputModalities": [
+        "text",
+        "image"
+      ],
+      "instructionOverlay": "filesystem-mcp-discipline",
+      "requestProfile": "xai-reasoning",
+      "supportsReasoningSummaries": true,
+      "searchTool": {
+        "mode": "hosted"
+      },
+      "supportsImageDetailOriginal": true,
+      "availabilityNux": "Grok 4.7 Fast is xAI's high-speed frontier model variant.",
+      "compHash": "grok-oauth-grok-4-7-fast-v1"
+    }
+  ]
+}

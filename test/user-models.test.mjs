@@ -69,6 +69,7 @@ test("curation metadata can set sizing and the effort ladder", () => {
       serviceTiers: [{ id: "priority", name: "Fast" }],
       supportsSearchHistory: true,
       requiresTrailingUserTurn: true,
+      usesGoogleToolSchema: true,
       isFree: true,
     },
   });
@@ -79,6 +80,7 @@ test("curation metadata can set sizing and the effort ladder", () => {
   assert.deepEqual(entry.serviceTiers, [{ id: "priority", name: "Fast" }]);
   assert.equal(entry.supportsSearchHistory, true);
   assert.equal(entry.requiresTrailingUserTurn, true);
+  assert.equal(entry.usesGoogleToolSchema, true);
   assert.equal(entry.isFree, true);
 });
 
@@ -265,6 +267,11 @@ test("registry merges valid user models and skips collisions", async () => {
       ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-bad-trailing-turn", priority: 111 }),
       requiresTrailingUserTurn: "yes",
     },
+    // Google tool-schema normalization is an explicit boolean transport flag.
+    {
+      ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-bad-google-schema", priority: 113 }),
+      usesGoogleToolSchema: "yes",
+    },
     // Local state is not a repository certificate. A hand-edited overlay must
     // never make its own route appear as a native v2 subagent.
     {
@@ -341,6 +348,7 @@ test("registry merges valid user models and skips collisions", async () => {
   assert.ok(slugs.includes("deepseek/deepseek-standalone-search"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-detail"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-trailing-turn"));
+  assert.ok(!slugs.includes("deepseek/deepseek-bad-google-schema"));
   assert.ok(!slugs.includes("deepseek/deepseek-self-certified"));
   assert.ok(!slugs.includes("deepseek/deepseek-summary-without-support"));
   assert.ok(!slugs.includes("deepseek/deepseek-invalid-summary-support"));

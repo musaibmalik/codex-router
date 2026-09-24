@@ -68,6 +68,8 @@ const METADATA_FIELDS = new Set([
   "availabilityNux",
   "upgradeTo",
   "requiresTrailingUserTurn",
+  "usesGoogleToolSchema",
+  "upstreamModelsByEffort",
   "isFree",
   "toolSchemaRecursion",
   "supportedEndpoints",

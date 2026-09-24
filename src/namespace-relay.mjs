@@ -2467,7 +2467,12 @@ export class NamespaceToolCallTransform extends Transform {
       Number.isInteger(options.maxSseFrameBytes) && options.maxSseFrameBytes > 0
         ? options.maxSseFrameBytes
         : undefined;
-    this.#maxSseFrameBytes = configuredSseFrameBytes ?? MAX_SSE_FRAME_BYTES;
+    // A request-sized opening allowance must not lower the separate terminal
+    // bound: completed responses can also contain generated content.
+    this.#maxSseFrameBytes =
+      Number.isInteger(options.maxOpeningSseFrameBytes) && options.maxOpeningSseFrameBytes > 0
+        ? options.maxOpeningSseFrameBytes
+        : configuredSseFrameBytes ?? MAX_SSE_FRAME_BYTES;
     this.#maxCommittedSseFrameBytes =
       Number.isInteger(options.maxCommittedSseFrameBytes) &&
       options.maxCommittedSseFrameBytes > 0

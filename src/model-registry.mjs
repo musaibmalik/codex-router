@@ -1,3 +1,4 @@
+import { customModelEffortProblem } from "./custom-model-effort.mjs";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
@@ -631,6 +632,8 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   if (model.instructionOverlay !== undefined && !instructionOverlayExists(model.instructionOverlay)) {
     return `model ${model.slug} has an invalid instructionOverlay`;
   }
+  const effortMappingProblem = customModelEffortProblem(model);
+  if (effortMappingProblem) return effortMappingProblem;
   if (model.requestProfile !== undefined && !requestProfileKnown(model.requestProfile)) {
     return `model ${model.slug} has an invalid requestProfile`;
   }
@@ -669,6 +672,12 @@ function modelProblem(model, providers, slugs, gatewayModels) {
     typeof model.requiresTrailingUserTurn !== "boolean"
   ) {
     return `model ${model.slug} has an invalid requiresTrailingUserTurn flag`;
+  }
+  if (
+    model.usesGoogleToolSchema !== undefined &&
+    typeof model.usesGoogleToolSchema !== "boolean"
+  ) {
+    return `model ${model.slug} has an invalid usesGoogleToolSchema flag`;
   }
   if (
     model.multiAgentVersion !== undefined &&
@@ -905,6 +914,19 @@ function validatedStaticModelSlugAliases({ models, providers }) {
 // User-curated models extend the checked-in registry. A broken entry (or a
 // collision after an upstream update ships the same model) must never take
 // the whole router down, so problems skip the entry and surface as warnings.
+// A custom container can serve the same upstream ID at different endpoints.
+// Only an identical endpoint/auth descriptor may inherit a checked-in alias.
+export function modelRouteIdentity(model) {
+  const route = `${model?.provider}\0${model?.upstreamModel}`;
+  if (model?.provider !== "custom") return route;
+  const { id, kind, note, ...endpoint } = model.endpoint || {};
+  const stable = (value) => Array.isArray(value) ? value.map(stable)
+    : value && typeof value === "object"
+      ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]))
+      : value;
+  return `${route}\0${JSON.stringify(stable({ ...endpoint, protocol: endpoint.protocol || "openai" }))}`;
+}
+
 function mergeUserModels(base, staticAliases) {
   const warnings = [];
   const models = [...base.models];
@@ -916,7 +938,7 @@ function mergeUserModels(base, staticAliases) {
   // the exact same endpoint and the picker shows a duplicate model. Keep the
   // replacement so persisted visibility can follow the canonical slug.
   const checkedInRoutes = new Map(
-    models.map((model) => [`${model.provider}\0${model.upstreamModel}`, model]),
+    models.map((model) => [modelRouteIdentity(model), model]),
   );
   const aliases = new Map();
   const userModels = new Set();
@@ -932,7 +954,7 @@ function mergeUserModels(base, staticAliases) {
       );
       continue;
     }
-    const checkedIn = checkedInRoutes.get(`${model?.provider}\0${model?.upstreamModel}`);
+    const checkedIn = checkedInRoutes.get(modelRouteIdentity(model));
     if (checkedIn) {
       if (typeof model?.slug === "string" && model.slug && model.slug !== checkedIn.slug) {
         // An old curation slug is safe as an alias only while nothing else

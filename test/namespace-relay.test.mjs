@@ -5589,3 +5589,24 @@ test("the kimi route still copies nothing when no tool carries a foreign ref", (
   ];
   assert.equal(repairToolSchemaRoots(tools, { inlineForeignRefs: true }), tools);
 });
+
+
+test("opening allowance preserves the larger terminal capture bound", async () => {
+  const { namespaces } = flattenNamespaceTools([{ type: "namespace", name: "mcp__cua_repl",
+    tools: [{ type: "function", name: "js" }] }]);
+  const call = { type: "function_call", id: "fc_cua_bound", call_id: "call_cua_bound",
+    name: "mcp__cua_repl__js", arguments: "{}" };
+  const events = [
+    { type: "response.created", response: { instructions: "x".repeat(300 * 1024) } },
+    { type: "response.output_item.done", item: call },
+    { type: "response.completed", response: { output: [call], instructions: "x".repeat(600 * 1024) } },
+  ];
+  const frames = events.map(e => Buffer.from(`data: ${JSON.stringify(e)}\n\n`));
+  const output = await collect(Readable.from(frames).pipe(new NamespaceToolCallTransform(
+    namespaces, "text/event-stream", undefined, { maxOpeningSseFrameBytes: 400 * 1024 },
+  )));
+  const payloads = output.split("\n").filter(l => l.startsWith("data: ")).map(l => JSON.parse(l.slice(6)));
+  assert.equal(payloads[1].item.namespace, "mcp__cua_repl");
+  assert.equal(payloads[2].response.output[0].namespace, "mcp__cua_repl");
+  assert.equal(payloads[2].response.instructions.length, 600 * 1024);
+});

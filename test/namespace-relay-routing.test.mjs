@@ -2212,3 +2212,34 @@ test("OpenCode Go compaction removes native tool history before the strict endpo
     false,
   );
 });
+
+
+test("large echoed tool inventory preserves CUA namespace restoration", async () => {
+  const call = { type: "function_call", id: "fc_cua", call_id: "call_cua",
+    name: "mcp__cua_repl__js", arguments: JSON.stringify({ code: "await cua.getState();" }) };
+  const result = await scenario(true, {
+    requestPayload: (stream, model) => ({ model, stream,
+      input: [{ role: "user", content: "Read browser state." }],
+      tools: [{ type: "namespace", name: "mcp__cua_repl", tools: [{
+        type: "function", name: "js", description: "x".repeat(1100000),
+        parameters: { type: "object", properties: { code: { type: "string" } } },
+      }] }],
+    }),
+    sseBody: (outgoing) => {
+      const opening = sseEvent({ type: "response.created",
+        response: { tools: outgoing.tools, output: [] } });
+      assert.ok(Buffer.byteLength(opening) > 1024 * 1024);
+      return opening + sseEvent({ type: "response.output_item.added", item: { ...call, arguments: "" } }) +
+        sseEvent({ type: "response.output_item.done", item: call }) +
+        sseEvent({ type: "response.completed", response: { output: [call], tools: outgoing.tools } }) +
+        "data: [DONE]\n\n";
+    },
+  });
+  assert.ok(result.gatewayBodies[0].tools.some(t => t.name === "mcp__cua_repl__js"));
+  const restored = functionCallsFromSse(result.clientBody).get("call_cua");
+  assert.equal(restored.name, "js");
+  assert.equal(restored.namespace, "mcp__cua_repl");
+  assert.equal(restored.arguments, call.arguments);
+  const completed = result.clientBody.split("\n").filter(l => l.startsWith("data: {")).map(l => JSON.parse(l.slice(6))).find(e => e.type === "response.completed");
+  assert.equal(completed.response.output[0].namespace, "mcp__cua_repl");
+});

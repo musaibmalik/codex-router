@@ -7,7 +7,7 @@
       "upstreamModel": "grok-4.6",
       "provider": "grok-oauth",
       "listed": true,
-      "displayName": "Grok 4.6 (OAuth)",
+      "displayName": "Grok 4.6",
       "description": "Grok 4.6 through the official Grok CLI OAuth session with long-running agentic coding, tool calls, and hosted web/X search.",
       "priority": 1,
       "defaultEffort": "high",

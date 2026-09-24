@@ -6,7 +6,7 @@ export function shouldAliasViewImageForGrok(chat) {
   // native Codex name, even when tool_choice is required. A dedicated alias
   // selects normally; keep the rewrite request-scoped so a real client tool
   // already named inspect_image retains its own identity.
-  if (chat?.model !== "grok-4.6") return false;
+  if (chat?.model !== "grok-4.6" && !chat?.model?.startsWith("grok-4.7")) return false;
   const names = new Set(
     (Array.isArray(chat?.tools) ? chat.tools : [])
       .filter((tool) => tool?.type === "function")

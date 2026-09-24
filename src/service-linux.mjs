@@ -63,6 +63,7 @@ function unit() {
   const environment = {
     PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
     MODEL_ROUTER_TARGET: TARGET,
+    MODEL_ROUTER_SUPERVISED: "1",
     MODEL_ROUTER_STATE_DIR: STATE_DIR,
     MODEL_ROUTER_QUIET: "1",
     MODEL_ROUTER_GATEWAY_PORT: String(PORTS.gateway),

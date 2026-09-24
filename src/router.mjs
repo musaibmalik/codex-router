@@ -9,6 +9,7 @@ import {
   zstdDecompress,
 } from "node:zlib";
 import { promisify } from "node:util";
+import { responsePreludeBudget } from "./response-prelude-budget.mjs";
 
 import {
   assertCallerSecret,
@@ -3230,6 +3231,10 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   if (rejectsWebSearchOptions(route)) delete routed.web_search_options;
   return {
     body: Buffer.from(JSON.stringify(routed), "utf8"),
+    responsePreludeBytes: responsePreludeBudget(routed, {
+      baseBytes: EMPTY_COMPLETION_PRELUDE_BYTES,
+      fixed: Boolean(process.env.CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_BYTES),
+    }),
     target: `${GATEWAY_BASE}/responses`,
     headers: routedHeaders(),
     // The exact mode used while constructing this body. Failover compares it
@@ -3561,10 +3566,24 @@ async function handleResponses(request, response, requestUrl) {
     let payload = await parseBodyAsync(body);
     controller.signal.throwIfAborted();
     requestedModel = typeof payload.model === "string" ? payload.model : "";
-    let registeredRoute =
-      MODEL_BY_SLUG.get(requestedModel) ??
-      MODEL_BY_SLUG.get(readNativeAliases()[requestedModel]);
-    // An unregistered model on this endpoint is native GPT traffic -- Codex's
+    let registeredRoute = MODEL_BY_SLUG.get(requestedModel);
+    // Registry slugs belong to their provider's namespace. A stale external
+    // model must not spend the caller's ChatGPT session, even when a native
+    // alias or redirect is configured. Unknown native IDs remain upstream's
+    // decision: a slash alone is not evidence of an external provider.
+    const modelNamespace = requestedModel.slice(0, requestedModel.indexOf("/"));
+    if (!registeredRoute && requestedModel.includes("/") && RUNTIME_PROVIDERS.has(modelNamespace)) {
+      writeJson(response, 404, {
+        error: {
+          type: "model_not_found",
+          model: requestedModel,
+          message: `External model ${requestedModel} is not registered in this router. Choose an available model or refresh its registration.`,
+        },
+      });
+      return;
+    }
+    registeredRoute ??= MODEL_BY_SLUG.get(readNativeAliases()[requestedModel]);
+    // Remaining unregistered models on this endpoint are native GPT traffic -- Codex's
     // background agent sessions arrive here hardwired to a native slug no
     // matter which model the user picked. With the redirect opted in, send
     // them to the configured routed model; a target that is unknown or whose
@@ -3649,6 +3668,7 @@ async function handleResponses(request, response, requestUrl) {
     let target;
     let headers;
     let routedBody;
+    let responsePreludeBytes = EMPTY_COMPLETION_PRELUDE_BYTES;
     let builtSearchMode;
     let namespacesFlattened = false;
     let flattenedNamespaces = new Map();
@@ -3675,6 +3695,7 @@ async function handleResponses(request, response, requestUrl) {
       target = built.target;
       headers = built.headers;
       routedBody = built.body;
+      responsePreludeBytes = built.responsePreludeBytes;
       builtSearchMode = built.searchMode;
       // The tray Island has to name the model that is actually answering.
       activity.setRoute({
@@ -3716,6 +3737,7 @@ async function handleResponses(request, response, requestUrl) {
       target = built.target;
       headers = built.headers;
       routedBody = built.body;
+      responsePreludeBytes = built.responsePreludeBytes;
       builtSearchMode = built.searchMode;
       // This provider has already said it would be empty until a named time.
       // Sending anyway buys one guaranteed rejection per turn for as long as
@@ -4058,14 +4080,23 @@ async function handleResponses(request, response, requestUrl) {
             route?.slug,
             // A native stream is attached only for the injection, so it must
             // not pick up the routed-provider rewrites on the way through.
-            { pendingInterrupts, injectOnly: !route },
+            {
+              pendingInterrupts,
+              injectOnly: !route,
+              // The gateway echoes tools in opening events. Keep namespace
+              // restoration active within the same bounded metadata allowance
+              // as the downstream guard; native/direct Responses retain defaults.
+              ...(route && !directResponses
+                ? { maxOpeningSseFrameBytes: responsePreludeBytes }
+                : {}),
+            },
           ),
         );
       }
       const guard =
         route && !directResponses && EMPTY_COMPLETION_RETRY
           ? new EmptyCompletionGuard(contentType, {
-              maxPreludeBytes: EMPTY_COMPLETION_PRELUDE_BYTES,
+              maxPreludeBytes: responsePreludeBytes,
               maxPreludeMs: EMPTY_COMPLETION_PRELUDE_MS,
             })
           : undefined;
@@ -4073,7 +4104,7 @@ async function handleResponses(request, response, requestUrl) {
         transforms.push(
           guard,
           new EmptyCompletionTerminalGuard(guard, contentType, {
-            maxHeldTerminalBytes: EMPTY_COMPLETION_PRELUDE_BYTES,
+            maxHeldTerminalBytes: responsePreludeBytes,
           }),
         );
       }

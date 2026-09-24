@@ -433,6 +433,65 @@ const TURN_BODY = {
   stream: true,
 };
 
+for (const [emptyFirst, fixed] of [[false, false], [true, false], [false, true]]) {
+  test(`fragmented echoed tool metadata over 1 MiB respects the request budget (empty first: ${emptyFirst}, fixed: ${fixed})`, async () => {
+    let posts = 0;
+    const gw = await gateway(async (request, response) => {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      posts += 1;
+      const id = emptyFirst && posts === 1 ? "large-empty" : "large-content";
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      const echo = (type) => `event: ${type}\ndata: ${JSON.stringify({
+        type, response: { id, tools: body.tools, instructions: body.instructions, output: [] },
+      })}\n\n`;
+      const wire = Buffer.from(
+        echo("response.created") + echo("response.in_progress") +
+        (emptyFirst && posts === 1 ? "" :
+          'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Recovered"}\n\n') +
+        echo("response.completed"),
+      );
+      // Flush partial events over real HTTP; a single complete event in one
+      // transform chunk used to hide the production failure.
+      for (let i = 0; i < wire.length && !response.destroyed; i += 16 * 1024) {
+        response.write(wire.subarray(i, i + 16 * 1024));
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      response.end();
+    });
+    const routerPort = await openPort();
+    const router = run({
+      ...routerEnv(gw.port, routerPort),
+      ...(fixed ? { CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_BYTES: String(1024 * 1024) } : {}),
+    });
+    try {
+      await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+      const result = await readRouted(routerPort, {
+        ...TURN_BODY,
+        instructions: "Follow the user's request.",
+        tools: [{ type: "function", name: "large_probe", description: "x".repeat(1100000),
+          parameters: { type: "object", properties: {} } }],
+      });
+      if (fixed) {
+        assert.equal(result.status, 502);
+        assert.match(result.body, /precontent_limit/);
+        assert.equal(posts, 2);
+        return;
+      }
+      assert.equal(result.status, 200);
+      assert.equal(result.complete, true);
+      assert.match(result.body, /Recovered/);
+      assert.doesNotMatch(result.body, /large-empty|precontent_limit/);
+      assert.equal(posts, emptyFirst ? 2 : 1);
+      assert.equal((result.body.match(/event: response\.completed/g) || []).length, 1);
+    } finally {
+      await stopChild(router);
+      await closeServer(gw.server);
+    }
+  });
+}
+
 // An empty completion used to reach the client as a clean 200 the app
 // recorded as a successful turn with no content. The router must retry the
 // identical request once and only surface the retry's completion.

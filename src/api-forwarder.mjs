@@ -1,3 +1,4 @@
+import { upstreamModelForEffort } from "./custom-model-effort.mjs";
 import http from "node:http";
 
 import {
@@ -423,6 +424,201 @@ function flattenRecursiveToolSchemas(payload, protocol) {
   );
 }
 
+// Google's strict FunctionDeclaration schema is a transport property, not a
+// Gemini-family property. Antigravity can serve non-Gemini models (including
+// Claude) through Vertex's schema converter, so those routes opt in without
+// inheriting Gemini-only thought-signature or conversation rewrites.
+function usesGoogleToolSchema(provider, model) {
+  return isGeminiProvider(provider, model) || model?.usesGoogleToolSchema === true;
+}
+
+const GEMINI_TOOL_SCHEMA_MAX_DEPTH = 64;
+const GEMINI_SCHEMA_MAP_KEYWORDS = ["properties", "patternProperties", "$defs", "definitions"];
+const GEMINI_SCHEMA_LIST_KEYWORDS = ["anyOf", "oneOf", "allOf", "prefixItems"];
+const GEMINI_SCHEMA_CHILD_KEYWORDS = [
+  "items",
+  "additionalProperties",
+  "contains",
+  "not",
+  "if",
+  "then",
+  "else",
+  "propertyNames",
+];
+
+function schemaObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function schemaRequiresObject(schema, depth = 0) {
+  if (!schemaObject(schema) || depth > GEMINI_TOOL_SCHEMA_MAX_DEPTH) return false;
+  // A declared scalar wins over descriptive properties, just as it does in
+  // the sanitizer below. A union merely offering an object must retain its
+  // other alternatives; adding type: object would make those unreachable.
+  if (schema.type !== undefined) return schema.type === "object";
+  if (schemaObject(schema.properties)) return true;
+  for (const keyword of ["anyOf", "oneOf"]) {
+    const branches = schema[keyword];
+    if (!Array.isArray(branches) || branches.length === 0) continue;
+    if (branches.every((branch) => schemaRequiresObject(branch, depth + 1))) return true;
+  }
+  return Array.isArray(schema.allOf) &&
+    schema.allOf.some((branch) => schemaRequiresObject(branch, depth + 1));
+}
+
+// Codex can attach provider-private metadata to dynamically supplied MCP/app
+// schemas. Google's FunctionDeclaration Schema protobuf rejects unknown fields
+// instead of ignoring them, and some MCP schemas also contain primitive values
+// where a `properties` map requires schema objects. Sanitize only the copy sent
+// over a Google-schema route: a real argument named `encrypted` remains under
+// `properties`, while the unsupported schema-node annotation is removed.
+function sanitizeGeminiToolSchema(schema, depth = 0) {
+  if (!schemaObject(schema)) return schema;
+  if (depth > GEMINI_TOOL_SCHEMA_MAX_DEPTH) return {};
+  let next = schema;
+  const replace = (key, value) => {
+    if (next === schema) next = { ...schema };
+    if (value === undefined) delete next[key];
+    else next[key] = value;
+  };
+
+  if ("encrypted" in schema) replace("encrypted", undefined);
+  if (Array.isArray(schema.enum)) {
+    // The Antigravity gateway serializes a nullable enum member as an empty
+    // string before building Vertex's Schema protobuf; Vertex then rejects the
+    // whole tool list with `enum[n]: cannot be empty`.
+    const values = schema.enum.filter((value) => value !== "" && value !== null);
+    if (values.length !== schema.enum.length) {
+      replace("enum", values.length ? values : undefined);
+    }
+  }
+  if (
+    schema.type === undefined &&
+    Array.isArray(schema.allOf) &&
+    schema.allOf.length > 0 &&
+    schema.allOf.every((branch) => schemaRequiresObject(branch))
+  ) {
+    // The gateway flattens allOf branches into `properties` but does not infer
+    // the parent type. Vertex then rejects those merged properties unless the
+    // composed schema explicitly declares OBJECT.
+    replace("type", "object");
+  }
+
+  // Vertex's Schema protobuf permits `properties` only on an OBJECT node.
+  // Some dynamically loaded tools attach descriptive child properties to a
+  // scalar item. Preserve the declared scalar and drop only those unusable
+  // object constraints; for an implicit/nullable object, make the type
+  // explicit instead.
+  if (schemaObject(schema.properties) && schema.type !== "object") {
+    if (schema.type === undefined || (Array.isArray(schema.type) && schema.type.includes("object"))) {
+      replace("type", "object");
+    } else {
+      replace("properties", undefined);
+      replace("required", undefined);
+      replace("additionalProperties", undefined);
+    }
+  }
+
+  // Vertex's Schema protobuf likewise permits `items` only on an ARRAY node.
+  // Some dynamically loaded app schemas omit that otherwise optional JSON
+  // Schema type, so make it explicit before the gateway builds its protobuf.
+  // When a schema declares an incompatible scalar/object type, preserve that
+  // declaration and remove only the unusable array constraint.
+  if (schemaObject(next.items) && next.type !== "array") {
+    if (next.type === undefined || (Array.isArray(next.type) && next.type.includes("array"))) {
+      replace("type", "array");
+    } else {
+      replace("items", undefined);
+    }
+  }
+
+  for (const keyword of GEMINI_SCHEMA_MAP_KEYWORDS) {
+    const node = next[keyword];
+    if (!schemaObject(node)) continue;
+    let changed = false;
+    let removedLiteralRef = false;
+    // Tool arguments may legally be named __proto__. A null-prototype map
+    // preserves that own key instead of invoking Object.prototype's setter.
+    const rewritten = Object.create(null);
+    for (const [name, child] of Object.entries(node)) {
+      if (keyword === "properties" && name === "$ref") {
+        changed = true;
+        removedLiteralRef = true;
+        continue;
+      }
+      const sanitized = schemaObject(child)
+        ? sanitizeGeminiToolSchema(child, depth + 1)
+        : {};
+      if (sanitized !== child) changed = true;
+      rewritten[name] = sanitized;
+    }
+    if (changed) replace(keyword, rewritten);
+    if (removedLiteralRef) {
+      const required = Array.isArray(schema.required)
+        ? schema.required.filter((name) => name !== "$ref")
+        : undefined;
+      if (required?.length !== schema.required?.length) {
+        replace("required", required.length ? required : undefined);
+      }
+      // The literal `$ref` was a tool argument, not a JSON Schema reference.
+      // Keep the object open so the model may still send it based on the
+      // surrounding description, while avoiding the gateway converter bug.
+      if (schema.additionalProperties === false) replace("additionalProperties", true);
+    }
+  }
+
+  for (const keyword of GEMINI_SCHEMA_LIST_KEYWORDS) {
+    const node = schema[keyword];
+    if (!Array.isArray(node)) continue;
+    let changed = false;
+    const rewritten = node.map((child) => {
+      if (!schemaObject(child)) {
+        changed = true;
+        return {};
+      }
+      const sanitized = sanitizeGeminiToolSchema(child, depth + 1);
+      if (sanitized !== child) changed = true;
+      return sanitized;
+    });
+    if (changed) replace(keyword, rewritten);
+  }
+
+  for (const keyword of GEMINI_SCHEMA_CHILD_KEYWORDS) {
+    // Earlier repairs may have removed an incompatible constraint. Recursing
+    // over the original would restore it if its child also needed a repair.
+    const child = next[keyword];
+    if (!schemaObject(child)) continue;
+    const sanitized = sanitizeGeminiToolSchema(child, depth + 1);
+    if (sanitized !== child) replace(keyword, sanitized);
+  }
+
+  return next;
+}
+
+function sanitizeGeminiTools(tools) {
+  if (!Array.isArray(tools)) return tools;
+  let changed = false;
+  const rewritten = tools.map((tool) => {
+    const parameters = tool?.function?.parameters ?? tool?.parameters;
+    let schema = parameters;
+    if (typeof parameters === "string") {
+      try {
+        schema = JSON.parse(parameters);
+      } catch {
+        return tool;
+      }
+    }
+    if (!schemaObject(schema)) return tool;
+    const sanitized = sanitizeGeminiToolSchema(schema);
+    if (sanitized === parameters) return tool;
+    changed = true;
+    return tool.function
+      ? { ...tool, function: { ...tool.function, parameters: sanitized } }
+      : { ...tool, parameters: sanitized };
+  });
+  return changed ? rewritten : tools;
+}
+
 // A trailing model turn is a destructive rewrite: it discards part of the
 // caller's conversation. Only Google's own provider gets that behavior from
 // identity. Resellers and custom endpoints must opt in per model after their
@@ -706,7 +902,7 @@ function normalizeBody(buffer, contentType, route) {
     throw error;
   }
 
-  payload.model = model.upstreamModel;
+  payload.model = upstreamModelForEffort(model, payload);
   // Embeddings have their own wire contract. Keep every provider-specific
   // input field unchanged and never send the body through a chat adapter.
   if (route === "/embeddings") {
@@ -753,7 +949,7 @@ function normalizeBody(buffer, contentType, route) {
   // upstream reasoning translation attaches for Gemini 3.x thinking models.
   // Left in place the 400 surfaces as a misleading native-ChatGPT fallback
   // error rather than a routing failure, so strip them before forwarding.
-  if (isGeminiProvider(provider)) {
+  if (isGeminiProvider(provider, model)) {
     delete payload.web_search_options;
     delete payload.thinking;
     delete payload.think;
@@ -768,6 +964,7 @@ function normalizeBody(buffer, contentType, route) {
   if (["fireworks", "opencode-go"].includes(provider.id)) {
     delete payload.web_search_options;
   }
+  if (usesGoogleToolSchema(provider, model)) payload.tools = sanitizeGeminiTools(payload.tools);
   // Meta refuses `search_content_types` on anything but a `web_search_preview`
   // tool, and Codex only ever sends the current spelling: its hosted search
   // tool is `type: "web_search"`, carrying search_content_types beside
