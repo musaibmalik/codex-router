@@ -22,6 +22,7 @@ import {
 } from "./paths.mjs";
 import { providerApiKeyServiceEnvironment } from "./provider-api-key-service-environment.mjs";
 import { serviceProxyEnvironment } from "./proxy-environment.mjs";
+import { serviceGrokPatchHookEnvironment } from "./grok-patch-hook-settings.mjs";
 import {
   skipServiceManagerCall,
   assertServiceWriteIsolated,
@@ -86,7 +87,12 @@ function environmentEntries() {
     CODEX_ROUTER_OAUTH_PORT: String(PORTS.oauth),
     CODEX_ROUTER_PORT: String(PORTS.router),
     CODEX_ROUTER_API_PORT: String(PORTS.api),
+    // Local: keep relayed subagent payloads for 6h so children spawned by a
+    // native parent keep working after the ChatGPT usage limit is reached.
+    MODEL_ROUTER_AGENT_PAYLOAD_CACHE_TTL_MS:
+      process.env.MODEL_ROUTER_AGENT_PAYLOAD_CACHE_TTL_MS || String(6 * 60 * 60 * 1_000),
     ...serviceProxyEnvironment(),
+    ...serviceGrokPatchHookEnvironment(),
     ...providerApiKeyServiceEnvironment(),
     ...(process.env.CODEX_ROUTER_SOURCE_ROOT
       ? { CODEX_ROUTER_SOURCE_ROOT: SOURCE_ROOT }

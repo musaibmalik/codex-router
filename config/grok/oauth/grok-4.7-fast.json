@@ -7,7 +7,6 @@
       "upstreamModel": "grok-4.7-build-fast",
       "provider": "grok-oauth",
       "listed": true,
-      "multiAgentVersion": "v2",
       "displayName": "Grok 4.7 Fast",
       "description": "Grok 4.7 Fast variant through the official Grok CLI OAuth session.",
       "priority": 0,

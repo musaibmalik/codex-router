@@ -31,6 +31,8 @@ const MUSE_12_ROUTES = [
 ];
 
 const MUSE_13_ROUTES = [
+  ["meta/muse-spark-1.3", "muse-spark-1.3", 1_048_576, 900_000],
+  ["meta/muse-spark-1.3-contributor", "muse-spark-1.3-contributor", 1_048_576, 900_000],
   ["openrouter/muse-spark-1.3", "meta/muse-spark-1.3", 1_048_576, 943_000],
   ["openrouter/muse-spark-1.3-contributor", "meta/muse-spark-1.3-contributor", 1_048_576, 943_000],
   ["nousresearch/muse-spark-1.3", "meta/muse-spark-1.3", 1_048_576, 943_000],
@@ -50,7 +52,10 @@ const FABLE_51_ROUTES = [
 // Additional confirmed routes 2026-09-03.
 const ADDITIONAL_ROUTES = [
   ["commandcode/qwen3.8-max-0902", "Qwen/Qwen3.8-Max-0902", 1_000_000, 900_000],
-  ["commandcode/glm-5.3-flash", "z-ai/glm-5.3-flash", 1_000_000, 900_000],
+  // 400K, not the 900K every other Command Code 1M route carries: the
+  // conservative threshold belongs to GLM-5.3-Flash rather than to a
+  // provider, and this entry shipped with the house default by accident.
+  ["commandcode/glm-5.3-flash", "z-ai/glm-5.3-flash", 1_000_000, 400_000],
   ["opencode-go-messages/qwen3.8-flash", "qwen3.8-flash", 262_144, 235_000],
 ];
 
@@ -132,11 +137,33 @@ test("Muse Spark 1.3 routes use auto-tool-choice request profile", () => {
   }
 });
 
+// Command Code documents no effort values for Muse Spark, so 1.3 keeps the
+// single `high` level and no reasoning summaries of its 1.2 route rather than
+// Meta's Responses ladder. Neither version has a Command Code Contributor route.
+test("Command Code Muse Spark 1.3 follows the Command Code 1.2 route", () => {
+  const model = MODEL_BY_SLUG.get("commandcode/muse-spark-1.3");
+  const previous = MODEL_BY_SLUG.get("commandcode/muse-spark-1.2");
+  assert.ok(model, "commandcode/muse-spark-1.3 is missing from the registry");
+  assert.equal(model.upstreamModel, "meta/muse-spark-1.3");
+  assert.equal(model.listed, true);
+  for (const field of ["contextWindow", "autoCompact", "defaultEffort", "requestProfile"]) {
+    assert.equal(model[field], previous[field], field);
+  }
+  assert.deepEqual(model.reasoningLevels, previous.reasoningLevels);
+  assert.deepEqual(model.inputModalities, previous.inputModalities);
+  assert.ok(!model.supportsReasoningSummaries);
+  assert.equal(MODEL_BY_SLUG.has("commandcode/muse-spark-1.3-contributor"), false);
+  assert.equal(MODEL_BY_SLUG.has("commandcode/muse-spark-1.2-contributor"), false);
+});
+
 test("Muse Spark reseller routes advertise text and image input", () => {
   const visionSlugs = [
     "meta/muse-spark-1.2",
     "meta/muse-spark-1.2-contributor",
+    "meta/muse-spark-1.3",
+    "meta/muse-spark-1.3-contributor",
     "commandcode/muse-spark-1.2",
+    "commandcode/muse-spark-1.3",
     "openrouter/muse-spark-1.2",
     "openrouter/muse-spark-1.2-contributor",
     "openrouter/muse-spark-1.3",
@@ -332,7 +359,7 @@ test("GLM-5.3-Flash input modalities include text and image", () => {
   assert.deepEqual(model.inputModalities, ["text", "image"]);
 });
 
-test("Qwen3.8 Flash opencode-go-messages has auto-tool-choice profile", () => {
+test("Qwen3.8 Flash opencode-go-messages omits tool_choice", () => {
   const model = MODEL_BY_SLUG.get("opencode-go-messages/qwen3.8-flash");
-  assert.equal(model.requestProfile, "auto-tool-choice");
+  assert.equal(model.requestProfile, "omit-tool-choice");
 });

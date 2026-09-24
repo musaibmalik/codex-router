@@ -238,8 +238,11 @@ test("an account switch during the request cannot overwrite the new account cach
     assert.equal(readFileSync(cachePath, "utf8"), contents);
   }));
 
-test("an account switch during a version revalidation cannot restamp the cache", () =>
+test("a version-mismatched cache is never restamped, account switch or not", () =>
   withCache(async (cachePath) => {
+    // The router no longer carries a restamp path at all: a client_version
+    // change sends an unconditional request, so a 304 here can only be a
+    // server ignoring us. Either way the stale body stays unblessed.
     const contents = JSON.stringify(fixtureCache(
       [{ slug: "gpt-before-switch" }],
       { client_version: "0.152.0" },
@@ -260,4 +263,157 @@ test("an account switch during a version revalidation cannot restamp the cache",
     });
     assert.equal(result.status, "failed");
     assert.equal(readFileSync(cachePath, "utf8"), contents);
+  }));
+
+test("a Codex upgrade asks outright instead of replaying the previous version's ETag", () =>
+  withCache(async (cachePath) => {
+    // The account endpoint gates natives on client_version, so the answer the
+    // old validator described is not the answer this client would get. Sending
+    // it invites a 304 that hides a newly released native forever (issue #645).
+    const staleModels = [{ slug: "gpt-5.6-sol", visibility: "list" }];
+    const upgradedModels = [
+      { slug: "gpt-5.6-sol", visibility: "list" },
+      { slug: "gpt-6-astra", visibility: "list" },
+    ];
+    writeFileSync(cachePath, JSON.stringify(fixtureCache(staleModels)));
+    let request;
+    const result = await refreshNativeAccountCatalog({
+      cachePath,
+      force: true,
+      now: Date.parse("2026-09-09T00:00:00.000Z"),
+      version: "0.153.4",
+      headersProvider,
+      discoveryOff: () => false,
+      lock: noLock,
+      fetchImpl: async (url, init) => {
+        request = { url, init };
+        return new Response(JSON.stringify({ models: upgradedModels }), {
+          status: 200,
+          headers: { etag: 'W/"astra-account-catalog"' },
+        });
+      },
+    });
+
+    assert.match(request.url, /client_version=0\.153\.4/);
+    assert.equal(
+      request.init.headers["if-none-match"],
+      undefined,
+      "an ETag from client_version 0.153.2 must not condition a 0.153.4 request",
+    );
+    assert.equal(result.status, "updated");
+    const written = JSON.parse(readFileSync(cachePath, "utf8"));
+    assert.deepEqual(written.models, upgradedModels);
+    assert.equal(written.client_version, "0.153.4");
+    assert.equal(written.etag, 'W/"astra-account-catalog"');
+  }));
+
+test("an unconditional request answered 304 leaves the stale cache unblessed", () =>
+  withCache(async (cachePath) => {
+    // Restamping the old body with the new client_version would make
+    // cacheIsFresh pass forever and freeze the picker at the pre-upgrade list.
+    const contents = `${JSON.stringify(fixtureCache([{ slug: "gpt-5.6-sol" }]), null, 2)}\n`;
+    writeFileSync(cachePath, contents);
+    const result = await refreshNativeAccountCatalog({
+      cachePath,
+      force: true,
+      now: Date.parse("2026-09-09T00:00:00.000Z"),
+      version: "0.153.4",
+      headersProvider,
+      discoveryOff: () => false,
+      lock: noLock,
+      fetchImpl: async () => new Response(null, { status: 304 }),
+    });
+    assert.equal(result.status, "failed");
+    assert.equal(readFileSync(cachePath, "utf8"), contents);
+  }));
+
+test("a matching client_version still revalidates with its own ETag", () =>
+  withCache(async (cachePath) => {
+    const contents = `${JSON.stringify(fixtureCache([{ slug: "gpt-5.6-sol" }]), null, 2)}\n`;
+    writeFileSync(cachePath, contents);
+    let request;
+    const result = await refreshNativeAccountCatalog({
+      cachePath,
+      force: true,
+      version: "0.153.2",
+      headersProvider,
+      discoveryOff: () => false,
+      lock: noLock,
+      fetchImpl: async (url, init) => {
+        request = { url, init };
+        return new Response(null, { status: 304 });
+      },
+    });
+    assert.equal(request.init.headers["if-none-match"], 'W/"old-account-catalog"');
+    assert.equal(result.status, "not-modified");
+    assert.equal(readFileSync(cachePath, "utf8"), contents);
+  }));
+
+test("an older resolved Codex cannot narrow the cache a newer client wrote", () =>
+  withCache(async (cachePath) => {
+    // Measured against the live endpoint: client_version 0.150.0 is not
+    // offered gpt-6-astra while 0.153.4 is. A stale `codex` on PATH must not
+    // be able to strip that model out of Codex's own cache (issue #645).
+    const contents = `${JSON.stringify(fixtureCache(
+      [{ slug: "gpt-5.6-sol" }, { slug: "gpt-6-astra" }],
+      { client_version: "0.153.4" },
+    ), null, 2)}\n`;
+    writeFileSync(cachePath, contents);
+    const forbidden = () => {
+      throw new Error("a downgrade must touch neither credential nor network");
+    };
+    const result = await refreshNativeAccountCatalog({
+      cachePath,
+      force: true,
+      version: "0.150.0",
+      headersProvider: forbidden,
+      discoveryOff: () => false,
+      lock: noLock,
+      fetchImpl: forbidden,
+    });
+    assert.equal(result.status, "stale-client");
+    assert.equal(readFileSync(cachePath, "utf8"), contents);
+  }));
+
+test("an equal or newer client version still refreshes", () =>
+  withCache(async (cachePath) => {
+    for (const version of ["0.153.4", "0.154.0"]) {
+      const models = [{ slug: "gpt-5.6-sol" }, { slug: "gpt-6-astra" }];
+      writeFileSync(cachePath, JSON.stringify(fixtureCache(
+        [{ slug: "gpt-5.6-sol" }],
+        { client_version: "0.153.4" },
+      )));
+      const result = await refreshNativeAccountCatalog({
+        cachePath,
+        force: true,
+        now: Date.parse("2026-09-09T00:00:00.000Z"),
+        version,
+        headersProvider,
+        discoveryOff: () => false,
+        lock: noLock,
+        fetchImpl: async () => new Response(JSON.stringify({ models }), { status: 200 }),
+      });
+      assert.equal(result.status, "updated", version);
+      assert.deepEqual(JSON.parse(readFileSync(cachePath, "utf8")).models, models);
+    }
+  }));
+
+test("an unparseable version on either side never blocks a refresh", () =>
+  withCache(async (cachePath) => {
+    const models = [{ slug: "gpt-6-astra" }];
+    writeFileSync(cachePath, JSON.stringify(fixtureCache(
+      [{ slug: "gpt-5.6-sol" }],
+      { client_version: "unknown-build" },
+    )));
+    const result = await refreshNativeAccountCatalog({
+      cachePath,
+      force: true,
+      now: Date.parse("2026-09-09T00:00:00.000Z"),
+      version: "0.150.0",
+      headersProvider,
+      discoveryOff: () => false,
+      lock: noLock,
+      fetchImpl: async () => new Response(JSON.stringify({ models }), { status: 200 }),
+    });
+    assert.equal(result.status, "updated");
   }));

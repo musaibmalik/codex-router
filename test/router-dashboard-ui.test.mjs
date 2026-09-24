@@ -48,12 +48,15 @@ test("the hourly traffic chart reads the router rollup instead of the capped eve
   // The rollup must be taken before the sample, and the sample must remain the
   // fallback for a router that predates the rollup.
   assert.ok(
-    hourly.indexOf("hourlyBucketsFromRollup(hours)") < hourly.indexOf("for (const event of events ?? [])"),
+    hourly.indexOf("hourlyBucketsFromRollup(hours, t)") < hourly.indexOf("for (const event of events ?? [])"),
     "the rollup should be preferred over the bounded event sample",
   );
   assert.match(page, /function hourlyBucketsFromRollup/);
   assert.match(page, /buildTrafficBuckets\(events, providerUsage, eventHours, trafficRange/);
   assert.match(page, /target\?\.usageEventHours/);
+  assert.match(hourly, /const windowStart = now - 24 \* HOUR_MS/);
+  assert.match(hourly, /Array\.from\(\{ length: bucketCount \}/);
+  assert.match(hourly, /at < windowStart \|\| at >= now/);
 
   const control = (await readFile(new URL("../src/control.mjs", import.meta.url), "utf8"))
     .replace(/\r\n/g, "\n");
@@ -62,4 +65,18 @@ test("the hourly traffic chart reads the router rollup instead of the capped eve
   assert.match(control, /hourlyUsageRollup\(\{ readEvents: \(\) => windowEvents \}\)/);
   assert.match(control, /windowEvents\.slice\(-usageEventsModule\.RECENT_USAGE_EVENT_LIMIT\)/);
   assert.match(control, /\n\s+usageEventHours,\n/);
+});
+
+
+test("chart dates follow the active translator without changing UTC bucket ownership", async () => {
+  const dashboard = await readFile(new URL("../apps/control-center/src/pages/DashboardPage.tsx", import.meta.url), "utf8");
+  const usage = await readFile(new URL("../apps/control-center/src/pages/UsagePage.tsx", import.meta.url), "utf8");
+  for (const source of [dashboard, usage]) {
+    assert.doesNotMatch(source, /new Intl\.DateTimeFormat\("en-US"/);
+    assert.match(source, /new Intl\.DateTimeFormat\(translatorLocale\(t\)/);
+  }
+  assert.match(dashboard, /buildTokenActivity\(events, providerUsage, Date\.now\(\), t\)/);
+  assert.match(dashboard, /\[events, providerUsage, t\]/);
+  assert.match(dashboard, /timeZone: "UTC"/);
+  assert.match(usage, /formatBucketDate\(buckets\[0\]\?\.startDate, t\)/);
 });

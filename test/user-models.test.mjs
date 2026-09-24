@@ -152,6 +152,16 @@ test("user models round-trip through the protected state file", () => {
   assert.ok(USER_MODELS_PATH.startsWith(stateDir));
 });
 
+test("readUserModels accepts a file saved with a UTF-8 byte-order mark", () => {
+  // PowerShell and Notepad on Windows write UTF-8 with a BOM (#887); a failed
+  // parse here would silently drop every curated model.
+  const entries = [
+    userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-bom-test", priority: 100 }),
+  ];
+  writeFileSync(USER_MODELS_PATH, `﻿${JSON.stringify({ version: 1, models: entries }, null, 2)}\n`);
+  assert.deepEqual(readUserModels(), entries);
+});
+
 test("readUserModels returns an empty list when the file is absent or invalid", () => {
   writeFileSync(USER_MODELS_PATH, "not-json\n");
   assert.deepEqual(readUserModels(), []);
@@ -366,6 +376,21 @@ test("registry merges valid user models and skips collisions", async () => {
   assert.ok(registry.USER_MODEL_WARNINGS.some((warning) => (
     /opencode-go\/grok-4\.5/.test(warning) && /collides with an existing model alias/.test(warning)
   )));
+  // The router cites why a slug has no route (#689), so each skipped entry's
+  // reason is kept by slug, including the ones dropped after the merge settles.
+  assert.match(
+    registry.USER_MODELS_SKIPPED.get("deepseek/deepseek-self-certified"),
+    /may not declare multiAgentVersion v2/,
+  );
+  assert.match(
+    registry.USER_MODELS_SKIPPED.get("no-such-provider/x-model"),
+    /references unknown provider no-such-provider/,
+  );
+  assert.match(
+    registry.USER_MODELS_SKIPPED.get("deepseek/deepseek-bad-upgrade"),
+    /upgrades to unknown model no-such\/model/,
+  );
+  assert.equal(registry.USER_MODELS_SKIPPED.has("deepseek/deepseek-user-test"), false);
   const merged = registry.MODEL_BY_SLUG.get("deepseek/deepseek-user-test");
   assert.equal(merged.listed, true);
   assert.equal(merged.availabilityNux, "Now available through your DeepSeek key.");

@@ -29,7 +29,13 @@ test("model discovery compares fixtures without needing or exposing a key", () =
   const fixture = path.join(testRoot, "models.json");
   writeFileSync(
     fixture,
-    JSON.stringify({ data: [{ id: "deepseek-v4-pro" }, { id: "deepseek-v5-preview" }] }),
+    JSON.stringify({
+      data: [
+        { id: "deepseek-flash" },
+        { id: "deepseek-v4-pro" },
+        { id: "deepseek-v5-preview" },
+      ],
+    }),
   );
   try {
     const output = execFileSync(
@@ -41,6 +47,7 @@ test("model discovery compares fixtures without needing or exposing a key", () =
     assert.deepEqual(result.unregistered, ["deepseek-v5-preview"]);
     assert.deepEqual(result.addable, ["deepseek-v5-preview"]);
     assert.deepEqual(result.blocked, {});
+    assert.ok(result.registered.includes("deepseek-flash"));
     assert.ok(result.unavailable.includes("deepseek-v4-flash"));
     assert.doesNotMatch(output, /Bearer|api[_-]?key/i);
   } finally {
@@ -74,6 +81,44 @@ test("OpenCode Go discovery blocks live ids whose protocol route is not certifie
     assert.match(
       result.blocked["future-responses-only-model"],
       /provider catalog lists future-responses-only-model.*has not verified whether the model uses Chat, Messages, or Responses.*router compatibility limitation.*future update/s,
+    );
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+// A control surface offers `addable` and shows `blocked` with its reason, so
+// the free ids OpenCode will not serve to this router have to reach it as the
+// second, not the first: every one of them would fail on its opening request.
+test("OpenCode Free discovery withholds the client-gated ids with their reason", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-opencode-free-discovery-"));
+  const fixture = path.join(testRoot, "models.json");
+  writeFileSync(
+    fixture,
+    JSON.stringify({ data: [
+      { id: "deepseek-v4-flash-free" },
+      { id: "mimo-v2.6-flash-free" },
+      { id: "big-pickle" },
+      { id: "glm-5.1" },
+    ] }),
+  );
+  try {
+    const output = execFileSync(
+      process.execPath,
+      ["src/model-discovery.mjs", "opencode-free", "--fixture", fixture, "--json"],
+      { cwd: root, encoding: "utf8", env: { ...process.env, OPENCODE_API_KEY: "" } },
+    );
+    const result = JSON.parse(output);
+    // The paid id never reaches the comparison: anonymousModelAllowed drops it.
+    assert.equal(result.discovered.includes("glm-5.1"), false);
+    assert.deepEqual(result.addable, ["deepseek-v4-flash-free"]);
+    assert.deepEqual(
+      Object.keys(result.blocked).sort(),
+      ["big-pickle", "mimo-v2.6-flash-free"],
+    );
+    assert.match(
+      result.blocked["mimo-v2.6-flash-free"],
+      /only to its own client.*can only be used from within OpenCode.*access policy/s,
     );
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
@@ -259,7 +304,7 @@ test("the current OpenCode catalogs remain fully fetchable without preselecting 
     "gpt-5.6-luna", "grok-4.5", "grok-4.6", "hy3", "hy3-preview", "kimi-k2.5", "kimi-k2.6",
     "kimi-k2.7-code", "kimi-k3", "longcat-2.0", "mimo-v2-omni", "mimo-v2-pro", "mimo-v2.5",
     "mimo-v2.5-pro", "minimax-m2.5", "minimax-m2.7", "minimax-m3",
-    "muse-spark-1.2-contributor", "muse-spark-1.3-contributor", "qwen3.5-plus", "qwen3.6-plus",
+    "muse-spark-1.2-contributor", "muse-spark-1.3-contributor", "omen-alpha", "qwen3.5-plus", "qwen3.6-plus",
     "qwen3.7-max", "qwen3.7-plus", "qwen3.8-flash", "qwen3.8-max",
   ];
   assert.deepEqual(
@@ -270,9 +315,9 @@ test("the current OpenCode catalogs remain fully fetchable without preselecting 
 
 test("the checked-in OpenCode Go set matches the official current-model table", () => {
   const documented = [
-    "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro", "glm-5", "glm-5.1", "glm-5.2", "glm-5.3", "glm-5.3-flash",
-    "gpt-5.6-luna", "grok-4.5", "grok-4.6", "hy3", "hy4-preview", "kimi-k2.5", "kimi-k2.6", "kimi-k2.7-code", "kimi-k3", "longcat-2.0",
-    "mimo-v2.5", "mimo-v2.5-pro", "minimax-m2.5", "minimax-m2.7", "minimax-m3",
+    "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro", "deepseek-v4.1-flash", "glm-5", "glm-5.1", "glm-5.2", "glm-5.3", "glm-5.3-flash",
+    "gpt-5.6-luna", "grok-4.5", "grok-4.6", "grok-4.7", "hy3", "hy4-preview", "kimi-k2.5", "kimi-k2.6", "kimi-k2.7-code", "kimi-k3", "longcat-2.0",
+    "mimo-v2.5", "mimo-v2.5-pro", "mimo-v2.6-flash", "mimo-v2.6-pro", "minimax-m2.5", "minimax-m2.7", "minimax-m3",
     "muse-spark-1.2-contributor", "muse-spark-1.3-contributor", "qwen3.5-plus", "qwen3.6-plus", "qwen3.7-max",
     "qwen3.7-plus", "qwen3.8-flash", "qwen3.8-max",
   ].sort();

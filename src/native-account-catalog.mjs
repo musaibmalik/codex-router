@@ -73,6 +73,24 @@ export function codexClientVersion(value = codexVersion()) {
   return match?.[1];
 }
 
+// Compare the numeric release triple of two client versions. A prerelease
+// suffix is deliberately ignored: it never widens the model list, and treating
+// "unparseable" as "not older" keeps the guard below from ever blocking a
+// refresh it cannot reason about.
+export function olderClientVersion(candidate, reference) {
+  const triple = (value) => {
+    const match = /^(\d+)\.(\d+)\.(\d+)/.exec(String(value || ""));
+    return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : undefined;
+  };
+  const left = triple(candidate);
+  const right = triple(reference);
+  if (!left || !right) return false;
+  for (let index = 0; index < 3; index += 1) {
+    if (left[index] !== right[index]) return left[index] < right[index];
+  }
+  return false;
+}
+
 function cacheIsFresh(cache, clientVersion, now) {
   if (!validCatalog(cache) || containsRoutedSlugs(cache)) return false;
   if (cache.client_version !== clientVersion) return false;
@@ -156,11 +174,31 @@ async function refreshNativeAccountCatalogUnlocked({
     return { status: "fresh", fingerprint: current.fingerprint };
   }
 
+  const safeCurrent = validCatalog(current.catalog) && !containsRoutedSlugs(current.catalog);
+  // models_cache.json is Codex's own cache, and this endpoint gates the model
+  // list on client_version: measured against the live endpoint, 0.150.0 is not
+  // offered gpt-6-astra while 0.153.4 is. If the Codex this router resolved is
+  // older than the client that last wrote the cache -- an outdated `codex` on
+  // PATH while the user runs a newer Codex, say -- then our answer is the
+  // poorer one, and writing it would take a model away from the Codex actually
+  // running (issue #645). Leave the richer cache alone and say why.
+  if (safeCurrent && olderClientVersion(clientVersion, current.catalog.client_version)) {
+    return { status: "stale-client", fingerprint: current.fingerprint };
+  }
+
   const accountHeaders = await headersProvider();
   if (!accountHeaders?.authorization) return { status: "unavailable" };
 
-  const safeCurrent = validCatalog(current.catalog) && !containsRoutedSlugs(current.catalog);
-  const etag = safeCurrent ? safeEtag(current.catalog.etag) : undefined;
+  // The account endpoint varies its answer on `client_version`: a Codex
+  // upgrade is exactly the moment a newly gated native joins the list, which
+  // is how GPT-6-Astra went missing for router installs (issue #645). An ETag
+  // earned under the previous client_version does not describe the answer
+  // this one would receive, so replaying it invites a 304 that pins the
+  // picker to the pre-upgrade catalog for good. Revalidate only within the
+  // version that issued the validator; across a version change, ask outright.
+  const etag = safeCurrent && current.catalog.client_version === clientVersion
+    ? safeEtag(current.catalog.etag)
+    : undefined;
   // Keep the credential sink fixed. Tests replace the transport, never the
   // destination, so this helper cannot be repurposed to send Codex auth to an
   // operator-controlled URL.
@@ -184,25 +222,13 @@ async function refreshNativeAccountCatalogUnlocked({
       signal: AbortSignal.timeout(timeoutMs),
       ...(dispatcher ? { dispatcher } : {}),
     });
-    if (response.status === 304 && safeCurrent) {
+    if (response.status === 304) {
       await Promise.resolve(response.body?.cancel?.()).catch(() => undefined);
-      // A client upgrade invalidates Codex's own cache even when the account
-      // ETag is unchanged. Restamp that one transition so later checks can use
-      // the normal TTL without rewriting a large unchanged cache every cycle.
-      if (current.catalog.client_version !== clientVersion) {
-        if (!sameAccountSession(accountHeaders, await headersProvider())) {
-          return { status: "failed" };
-        }
-        await writeCache(
-          cachePath,
-          {
-            ...current.catalog,
-            fetched_at: new Date(now).toISOString(),
-            client_version: clientVersion,
-          },
-          { directoryMode: 0o700 },
-        );
-      }
+      // Only a conditional request can be answered 304, and one is sent only
+      // when the cached validator belongs to this client_version. A 304 to an
+      // unconditional request is a server ignoring us, and blessing the stale
+      // body as current is precisely the freeze this guard exists to prevent.
+      if (!etag) return { status: "failed" };
       return { status: "not-modified", fingerprint: current.fingerprint };
     }
     if (!response.ok || response.status >= 300) {

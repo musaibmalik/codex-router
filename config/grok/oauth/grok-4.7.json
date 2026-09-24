@@ -7,10 +7,9 @@
       "upstreamModel": "grok-4.7",
       "provider": "grok-oauth",
       "listed": true,
-      "multiAgentVersion": "v2",
-      "displayName": "Grok 4.7",
+      "displayName": "Grok 4.7 (OAuth)",
       "description": "Grok 4.7 through the official Grok CLI OAuth session with long-running agentic coding, tool calls, and hosted web/X search.",
-      "priority": 0,
+      "priority": 1,
       "defaultEffort": "high",
       "reasoningLevels": [
         {
@@ -43,7 +42,7 @@
         "mode": "hosted"
       },
       "supportsImageDetailOriginal": true,
-      "availabilityNux": "Grok 4.7 is xAI's newest frontier flagship for long-running agents, coding, and ambitious interactive and visual work.",
+      "availabilityNux": "Grok 4.7 is xAI's newest flagship for long-running agents, coding, and knowledge work.",
       "compHash": "grok-oauth-grok-4-7-v1"
     }
   ]

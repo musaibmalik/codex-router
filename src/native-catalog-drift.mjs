@@ -85,9 +85,13 @@ export function nativeCatalogDriftDetected() {
       return false;
     }
 
-    // If no stored catalog exists yet, no drift to detect
+    // A missing capture is not "nothing to compare" -- it is maximal drift.
+    // Reaching here means Codex integration is installed (the guard above
+    // returns early otherwise), so a catalog was published from a capture
+    // that no longer exists and nothing else will notice the account gaining
+    // a model (issue #645). Republishing re-captures from the account cache.
     if (!existsSync(NATIVE_CATALOG_PATH)) {
-      return false;
+      return true;
     }
 
     // Read the stored native catalog
@@ -121,7 +125,19 @@ export async function republishOnNativeDrift({
   // model_catalog_json stops Codex's own account cache writer. Refresh the
   // fixed ChatGPT account endpoint first; on any failure the updater leaves
   // the prior cache untouched and the local drift comparison remains safe.
-  await refreshAccountCatalog();
+  const accountRefresh = await refreshAccountCatalog();
+  // Every other status is transient or a no-op, but this one is a standing
+  // misconfiguration that silently freezes the picker: the router keeps
+  // resolving a Codex older than the one that wrote the account cache, so it
+  // can never learn about a newly gated native (issue #645). Say so once per
+  // check rather than leaving the user to guess why a model never arrives.
+  if (accountRefresh?.status === "stale-client") {
+    console.error(
+      "[codex-router] The resolved Codex CLI is older than the client that wrote the account model cache; "
+        + "leaving the cache alone. Update Codex, or point CODEX_BIN at the Codex you actually run, "
+        + "so newly released native models can appear.",
+    );
+  }
   const nativeDrift = nativeDriftDetected();
   const routedAgentDrift = routedAgentDriftDetected();
   if (!nativeDrift && !routedAgentDrift) {

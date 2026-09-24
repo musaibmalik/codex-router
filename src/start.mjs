@@ -19,6 +19,7 @@ import {
 } from "./paths.mjs";
 import { SHUTDOWN_DRAIN_MS, SHUTDOWN_FLUSH_MS } from "./http-utils.mjs";
 import { waitForHealth as pollHealth } from "./health-probe.mjs";
+import { describeChildExit, fatalExitFollowUp } from "./fatal-exit.mjs";
 import { gatewaySupervisorLimits, superviseGateway } from "./gateway-supervisor.mjs";
 import { writeLiteLlmConfig } from "./litellm-config.mjs";
 import { MODELS } from "./model-registry.mjs";
@@ -399,6 +400,16 @@ async function main() {
       undefined,
       child,
     );
+  // The watchdog's probe is deliberately short: it runs on a timer while the
+  // gateway is otherwise idle, so it must never park the supervisor for the
+  // cold-start budget `gatewayHealthy` is allowed.
+  const gatewayLivenessCheck = () =>
+    waitForHealth(
+      "LiteLLM gateway liveness",
+      loopback(PORTS.gateway, "/health/liveliness"),
+      {},
+      4_000,
+    );
   const gateway = startGateway();
   await gatewayHealthy(gateway);
 
@@ -490,6 +501,7 @@ async function main() {
       start: startGateway,
       waitForExit,
       waitForHealth: gatewayHealthy,
+      healthCheck: gatewayLivenessCheck,
       isShuttingDown: () => shuttingDown,
       log: (message) => console.error(`[${frontendService}] ${message}`),
       ...gatewaySupervisorLimits(),
@@ -497,9 +509,14 @@ async function main() {
     waitForExit(router, frontend.label),
   ]);
   if (!shuttingDown) {
+    // A Windows fatal status is named in the line itself (src/fatal-exit.mjs)
+    // and earns a capture pointer on the next one; every other exit renders
+    // exactly as before. Crash lines are never gated on CODEX_ROUTER_QUIET.
     console.error(
-      `[${frontendService}] ${result.label} exited (code=${String(result.code)}, signal=${String(result.signal)}).`,
+      `[${frontendService}] ${result.label} exited (${describeChildExit(result)}).`,
     );
+    const followUp = fatalExitFollowUp(result);
+    if (followUp) console.error(`[${frontendService}] ${followUp}`);
   }
   return result.code || 0;
 }

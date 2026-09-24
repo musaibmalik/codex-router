@@ -1,6 +1,7 @@
 import { customModelEffortProblem } from "./custom-model-effort.mjs";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
+import { usesDeepSeekResponses } from "./deepseek-responses.mjs";
 
 import {
   genericProviderRuntimeDescriptor,
@@ -19,6 +20,7 @@ import { instructionOverlayExists } from "./instruction-overlays.mjs";
 import { SOURCE_ROOT } from "./paths.mjs";
 import { officialModelDisplayName, readUserModels } from "./user-models.mjs";
 import { curatableRequestProfile, requestProfileKnown } from "./request-profiles.mjs";
+import { VERTEX_ADAPTERS } from "./vertex-adapters.mjs";
 
 export const REGISTRY_PATH =
   process.env.MODEL_ROUTER_REGISTRY ||
@@ -127,7 +129,11 @@ function registryFragmentFiles(root) {
   for (const entry of readdirSync(root, { withFileTypes: true }).sort(byName)) {
     const full = path.join(root, entry.name);
     if (entry.isDirectory()) files.push(...registryFragmentFiles(full));
-    else if (entry.isFile() && entry.name.endsWith(".json")) files.push(full);
+    else if (
+      entry.isFile() &&
+      entry.name.endsWith(".json") &&
+      entry.name !== "support-catalog.json"
+    ) files.push(full);
   }
   return files;
 }
@@ -135,7 +141,10 @@ function registryFragmentFiles(root) {
 function parseFragment(file) {
   let parsed;
   try {
-    parsed = JSON.parse(readFileSync(file, "utf8"));
+    // Windows editors (PowerShell's Set-Content, Notepad) save UTF-8 with a
+    // leading byte-order mark, which JSON.parse rejects (#887). The registry
+    // is hand-edited configuration, so accept the mark.
+    parsed = JSON.parse(readFileSync(file, "utf8").replace(/^﻿/, ""));
   } catch (error) {
     fail(`${file}: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -254,10 +263,8 @@ function loadRegistry() {
       if (provider.keyless !== undefined && typeof provider.keyless !== "boolean") {
         fail(`provider ${provider.id} has an invalid keyless flag`);
       }
-      for (const field of ["directResponses", "codexOnly", "explicitSelection"]) {
-        if (provider[field] !== undefined && typeof provider[field] !== "boolean") {
-          fail(`provider ${provider.id} has an invalid ${field} flag`);
-        }
+      if (provider.explicitSelection !== undefined && typeof provider.explicitSelection !== "boolean") {
+        fail(`provider ${provider.id} has an invalid explicitSelection flag`);
       }
       if (provider.keyless && provider.credential !== undefined) {
         fail(`keyless provider ${provider.id} must not declare a credential`);
@@ -267,6 +274,7 @@ function loadRegistry() {
       if (provider.keyless && !loopbackBaseUrl(provider.baseUrl)) {
         fail(`keyless provider ${provider.id} must use a loopback baseUrl`);
       }
+      const credentialResolver = provider.credential?.resolver;
       if (
         provider.authMode !== undefined &&
         !["anonymous", "per-model"].includes(provider.authMode)
@@ -317,6 +325,21 @@ function loadRegistry() {
         fail(`provider ${provider.id} has anonymous metadata without authMode anonymous`);
       }
       if (
+        credentialResolver !== undefined &&
+        credentialResolver !== "google-application-default"
+      ) {
+        fail(`provider ${provider.id} has an unsupported credential resolver`);
+      }
+      if (credentialResolver === "google-application-default") {
+        if (provider.protocol !== "vertex") {
+          fail(`provider ${provider.id} may only use Google Application Default Credentials with the vertex protocol`);
+        }
+        if (
+          Object.keys(provider.credential || {}).some((field) => field !== "resolver")
+        ) {
+          fail(`provider ${provider.id} Google credential metadata must only declare resolver`);
+        }
+      } else if (
         !provider.keyless &&
         !["anonymous", "per-model"].includes(provider.authMode) &&
         (!provider.credential?.file || !Array.isArray(provider.credential.environment))
@@ -343,7 +366,8 @@ function loadRegistry() {
       }
       if (
         provider.protocol !== undefined &&
-        !["openai", "anthropic", "openai-responses"].includes(provider.protocol)
+        !["openai", "anthropic", "openai-responses", "openai-decisions", "vertex"]
+          .includes(provider.protocol)
       ) {
         fail(`provider ${provider.id} has an unsupported API protocol`);
       }
@@ -352,21 +376,6 @@ function loadRegistry() {
       }
       if (provider.transport === "ollama" && !provider.keyless) {
         fail(`provider ${provider.id} Ollama transport must be keyless`);
-      }
-      // A direct Responses provider bypasses LiteLLM so a Codex-native request
-      // envelope reaches a reviewed local bridge intact. Keep that exception
-      // narrower than the ordinary keyless-provider contract: no remote host,
-      // no protocol translation, and no publication to non-Codex clients.
-      if (
-        provider.directResponses &&
-        (!provider.keyless || provider.protocol !== "openai-responses" || !provider.codexOnly)
-      ) {
-        fail(
-          `direct Responses provider ${provider.id} must be keyless, openai-responses, and Codex-only`,
-        );
-      }
-      if (provider.codexOnly && !provider.directResponses) {
-        fail(`Codex-only provider ${provider.id} must use the direct Responses contract`);
       }
     }
     providers.set(provider.id, Object.freeze(provider));
@@ -618,6 +627,27 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   if (!model.slug.startsWith(`${model.provider}/`)) {
     return `model ${model.slug} must be namespaced under ${model.provider}/`;
   }
+  if (model.adapter !== undefined && typeof model.adapter !== "string") {
+    return "model " + model.slug + " has an invalid adapter";
+  }
+  if (provider.protocol === "vertex") {
+    if (!Object.hasOwn(VERTEX_ADAPTERS, model.adapter)) {
+      return "model " + model.slug + " requires a supported Vertex adapter";
+    }
+    if (
+      model.vertexPublisher !== undefined &&
+      (
+        typeof model.vertexPublisher !== "string" ||
+        !/^[a-z][a-z0-9._-]{0,127}$/i.test(model.vertexPublisher)
+      )
+    ) {
+      return "model " + model.slug + " has an invalid Vertex publisher";
+    }
+  } else if (model.adapter !== undefined) {
+    return "model " + model.slug + " may only set an adapter for a Vertex provider";
+  } else if (model.vertexPublisher !== undefined) {
+    return "model " + model.slug + " may only set a Vertex publisher for a Vertex provider";
+  }
   if (provider.authMode === "anonymous" && !anonymousModelAllowed(provider, model.upstreamModel)) {
     return `anonymous provider ${provider.id} only accepts its documented free-model ids`;
   }
@@ -851,6 +881,14 @@ function modelProblem(model, providers, slugs, gatewayModels) {
       return `listed model ${model.slug} requires a valid autoCompact limit`;
     }
     if (
+      model.maxOutputTokens !== undefined &&
+      (!Number.isInteger(model.maxOutputTokens) ||
+        model.maxOutputTokens < 1 ||
+        model.maxOutputTokens > model.contextWindow)
+    ) {
+      return `listed model ${model.slug} has an invalid maxOutputTokens`;
+    }
+    if (
       !Array.isArray(model.inputModalities) ||
       model.inputModalities.length === 0 ||
       model.inputModalities.some((value) => !["text", "image"].includes(value))
@@ -942,6 +980,16 @@ function mergeUserModels(base, staticAliases) {
   );
   const aliases = new Map();
   const userModels = new Set();
+  // Slug -> why it was skipped. The router cites this when a caller asks for a
+  // slug that therefore has no route (#689), and the doctor reports it; the
+  // warning strings themselves stay unchanged for curate-models.
+  const skipped = new Map();
+  const skip = (model, reason) => {
+    warnings.push(`Skipped user model: ${reason}`);
+    if (typeof model?.slug === "string" && model.slug && !skipped.has(model.slug)) {
+      skipped.set(model.slug, reason);
+    }
+  };
   for (const model of readUserModels()) {
     // A mutable local overlay may describe routing and presentation, but it
     // cannot grant itself the repository's native-collaboration certificate.
@@ -949,9 +997,7 @@ function mergeUserModels(base, staticAliases) {
     // they are settled and never spend a cloud compatibility probe. Preserve
     // that denial, but refuse the positive certificate.
     if (model?.multiAgentVersion === "v2") {
-      warnings.push(
-        `Skipped user model: model ${model?.slug || "<unknown>"} may not declare multiAgentVersion v2`,
-      );
+      skip(model, `model ${model?.slug || "<unknown>"} may not declare multiAgentVersion v2`);
       continue;
     }
     const checkedIn = checkedInRoutes.get(modelRouteIdentity(model));
@@ -966,28 +1012,27 @@ function mergeUserModels(base, staticAliases) {
           || staticAliases.has(model.slug)
           || aliases.has(model.slug)
         ) {
-          warnings.push(
-            `Skipped user model: alias ${model.slug} for checked-in route ${checkedIn.slug} collides with an existing model or alias`,
+          skip(
+            model,
+            `alias ${model.slug} for checked-in route ${checkedIn.slug} collides with an existing model or alias`,
           );
           continue;
         }
         aliases.set(model.slug, checkedIn.slug);
       }
-      warnings.push(
-        `Skipped user model: ${model?.slug || "<unknown>"} duplicates checked-in route ${checkedIn.slug}`,
-      );
+      skip(model, `${model?.slug || "<unknown>"} duplicates checked-in route ${checkedIn.slug}`);
       continue;
     }
     if (
       typeof model?.slug === "string"
       && (staticAliases.has(model.slug) || aliases.has(model.slug))
     ) {
-      warnings.push(`Skipped user model: model slug ${model.slug} collides with an existing model alias`);
+      skip(model, `model slug ${model.slug} collides with an existing model alias`);
       continue;
     }
     const problem = modelProblem(model, base.providers, slugs, gatewayModels);
     if (problem) {
-      warnings.push(`Skipped user model: ${problem}`);
+      skip(model, problem);
       continue;
     }
     slugs.add(model.slug);
@@ -1003,7 +1048,7 @@ function mergeUserModels(base, staticAliases) {
     if (!userModels.has(model)) return true;
     const problem = upgradeTargetProblem(model, modelBySlug);
     if (problem) {
-      warnings.push(`Skipped user model: ${problem}`);
+      skip(model, problem);
       return false;
     }
     return true;
@@ -1012,6 +1057,15 @@ function mergeUserModels(base, staticAliases) {
     models: Object.freeze(kept),
     warnings: Object.freeze(warnings),
     aliases: new Map(aliases),
+    skipped: new Map(skipped),
+    // Which surviving routes came from the operator's overlay rather than the
+    // checked-in tree. The merge is the only place that still knows: both
+    // sides are normalized into the same shape, so afterwards a local entry is
+    // indistinguishable from a shipped one. Curation removal is the caller --
+    // it may prune these and only these.
+    userSlugs: Object.freeze(new Set(
+      kept.filter((model) => userModels.has(model)).map((model) => model.slug),
+    )),
   };
 }
 
@@ -1035,7 +1089,15 @@ export const RUNTIME_PROVIDER_WARNINGS = runtime.warnings;
 // cannot certify itself for every installer.
 export const CHECKED_IN_MODELS = registry.models;
 export const MODELS = merged.models;
+// Slugs of the locally curated models in MODELS -- the `user-models.json`
+// overlay entries that survived the merge. A desktop surface offers removal
+// only for these, because curation removal prunes the overlay and can never
+// delete a route this checkout ships.
+export const LOCAL_MODEL_SLUGS = merged.userSlugs;
 export const USER_MODEL_WARNINGS = merged.warnings;
+// Slug -> the reason that user model was left out of MODELS. A slug here may
+// still route through a curation alias; callers check MODEL_BY_SLUG first.
+export const USER_MODELS_SKIPPED = merged.skipped;
 // Old curated public slugs that now resolve to a checked-in route. Catalog
 // publication migrates picker decisions through these aliases before applying
 // defaults, so an update removes the duplicate without hiding the model.
@@ -1057,5 +1119,10 @@ export const MODEL_BY_GATEWAY_ID = new Map(
 );
 
 export function providerForModel(model) {
-  return RUNTIME_PROVIDERS.get(model.provider);
+  const provider = RUNTIME_PROVIDERS.get(model.provider);
+  // One credential/provider identity can serve both its legacy Chat aliases
+  // and the current direct Flash model's native Responses contract.
+  return usesDeepSeekResponses(model) && provider
+    ? { ...provider, protocol: "openai-responses" }
+    : provider;
 }

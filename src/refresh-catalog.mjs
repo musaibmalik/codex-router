@@ -37,7 +37,7 @@ export function refreshCatalogCompletionMessage(status) {
   if (status === "disabled") {
     return "Bundled native and external model catalogs refreshed. Fully quit and reopen Codex.\n";
   }
-  if (status === "failed" || status === "unavailable") {
+  if (status === "failed" || status === "unavailable" || status === "stale-client") {
     return "External models refreshed; native models were rebuilt from available cached and bundled data because the live account catalog could not be refreshed. Fully quit and reopen Codex.\n";
   }
   return "Native account, bundled, and external model catalogs refreshed. Fully quit and reopen Codex.\n";
@@ -45,7 +45,7 @@ export function refreshCatalogCompletionMessage(status) {
 
 function restoreTransport(
   run,
-  { signed, loginFree, loginFreeModel, loginFreeDisplayModel },
+  { signed, signedProviderMode, loginFree, loginFreeModel, loginFreeDisplayModel },
   aliasFor,
 ) {
   if (loginFree) {
@@ -60,7 +60,12 @@ function restoreTransport(
     );
   } else {
     checked(run, "config-manager.mjs", ["enable"]);
-    if (signed) checked(run, "config-manager.mjs", ["signed-enable"]);
+    if (signed) {
+      checked(run, "config-manager.mjs", [
+        "signed-enable",
+        ...(signedProviderMode === "root-openai" ? ["--preserve-root-openai"] : []),
+      ]);
+    }
   }
   try {
     checked(run, "catalog.mjs", []);
@@ -131,6 +136,7 @@ async function refreshCatalogUnlocked({
   }
   const transport = {
     signed,
+    signedProviderMode: signed ? status.signed_provider_mode : undefined,
     loginFree,
     loginFreeDisplayModel: loginFree
       ? pendingJournal?.displayModel || status.model
