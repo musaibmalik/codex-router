@@ -6298,6 +6298,11 @@ const server = http.createServer((request, response) => {
     // its own transport wording -- `stream disconnected before completion` --
     // and an unreachable upstream is indistinguishable from a router bug.
     const transport = describeTransportFailure(error);
+    // Relay errors carry fixed, router-authored text (never payload or upstream
+    // bodies), and they tell the user how to recover, so they are safe to show.
+    const relayGuidance = /^ERR_NATIVE_AGENT_RELAY_/.test(String(error?.code || ""))
+      ? error.message
+      : undefined;
     if (!response.headersSent) {
       writeJson(response, status, {
         error: {
@@ -6305,7 +6310,7 @@ const server = http.createServer((request, response) => {
           code: transport?.code || error?.code,
           message: transport
             ? `The local router could not complete the request: ${transport.cause}.${transport.hint}`
-            : "The local router could not complete the request.",
+            : relayGuidance || "The local router could not complete the request.",
         },
       });
     } else {
