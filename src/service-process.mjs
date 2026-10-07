@@ -8,7 +8,12 @@ import {
   SOURCE_ROOT,
   STATE_DIR,
 } from "./paths.mjs";
-import { processCommandLine, processStartIdentity } from "./process-identity.mjs";
+import {
+  COLD_START_WINDOWS_PROBE_BUDGET,
+  processCommandLine,
+  processStartIdentity,
+} from "./process-identity.mjs";
+import { startupTimeoutMs } from "./startup-timeout.mjs";
 
 const STATE_VERSION = 1;
 
@@ -24,6 +29,29 @@ function safePid(pid) {
   return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
 }
 
+// `bin/start --foreground` and `codex-router.ps1 start --foreground` enter
+// through src/foreground-start.mjs, the explicit unmanaged debugging
+// supervisor. Its command line names foreground-start.mjs, never
+// src/start.mjs, so it could never pass the entrypoint check below -- and it
+// must not try: this record is the Windows service manager's handle on the
+// OS-service payload, a direct src/start.mjs, and only that payload refuses to
+// run without it. The opt-out is an explicit flag rather than a comparison of
+// process.argv[1] with this checkout's start.mjs because the flag fails
+// closed: every other importer still records, where a casing or junction
+// difference in argv would let a managed start silently skip its record.
+let foregroundSupervisor = false;
+
+export function markForegroundSupervisor() {
+  foregroundSupervisor = true;
+}
+
+export function shouldRecordServiceProcess({
+  platform = process.platform,
+  foreground = foregroundSupervisor,
+} = {}) {
+  return platform === "win32" && !foreground;
+}
+
 export function buildServiceProcessState({
   pid = process.pid,
   platform = process.platform,
@@ -32,11 +60,12 @@ export function buildServiceProcessState({
   sourceRoot = SOURCE_ROOT,
   stateDir = STATE_DIR,
   ports = PORTS,
+  probeBudget,
 } = {}) {
   const safe = safePid(pid);
   if (!safe) return undefined;
-  const processIdentity = identity(safe, { platform });
-  const liveCommandLine = commandLine(safe, { platform });
+  const processIdentity = identity(safe, { platform, budget: probeBudget });
+  const liveCommandLine = commandLine(safe, { platform, budget: probeBudget });
   if (!processIdentity || !liveCommandLine) return undefined;
   const entrypoint = entrypointFor(sourceRoot);
   if (!normalized(liveCommandLine).includes(entrypoint)) return undefined;
@@ -58,13 +87,39 @@ export function buildServiceProcessState({
 }
 
 export function writeServiceProcessState(options = {}) {
-  const state = buildServiceProcessState(options);
+  const state = buildServiceProcessState({
+    ...options,
+    // The one call site allowed to wait out a cold powershell.exe: this runs
+    // before any child starts, and there is no enclosing deadline to outlive.
+    probeBudget: {
+      ...COLD_START_WINDOWS_PROBE_BUDGET,
+      timeoutMs: startupTimeoutMs(
+        "CODEX_ROUTER_WINDOWS_PROCESS_PROBE_TIMEOUT_MS",
+        COLD_START_WINDOWS_PROBE_BUDGET.timeoutMs,
+      ),
+    },
+  });
   if (!state) {
     throw new Error(
       "The Windows service could not verify its own start.mjs process identity; refusing to run without a stoppable process record.",
     );
   }
-  writePrivateJson(options.statePath || SERVICE_PROCESS_STATE_PATH, state);
+  writePrivateJson(options.statePath || SERVICE_PROCESS_STATE_PATH, state, {
+    // This record is the only thing that lets the Windows service manager stop
+    // the tree it owns, so losing the write is fatal -- but a PowerShell that
+    // cannot start must not be what loses it. It carries a PID, an identity
+    // string, paths and ports, never a credential, and what makes it safe to
+    // act on is the verification in serviceProcessOwns below, not its secrecy:
+    // a hand-edited record for another checkout is rejected on sourceRoot,
+    // stateDir, command line and identity before any PID can be signalled.
+    //
+    // The fallback is the state directory's inherited ACL (SYSTEM,
+    // Administrators and the owner all hold FullControl on this profile path),
+    // not an owner-only one. That is a weaker ACL on a non-secret file for as
+    // long as the helper cannot run; the alternative was refusing to start the
+    // whole router over it.
+    hardenFailure: "warn",
+  });
   return state;
 }
 
@@ -93,6 +148,10 @@ export function serviceProcessOwns(
     commandLine = processCommandLine,
     sourceRoot = SOURCE_ROOT,
     stateDir = STATE_DIR,
+    // Deliberately the tight default: this runs inside a service stop that
+    // declares 15s and a restart phase that reserves 10s for the process-owner
+    // check, so it must not be able to wait out a cold host.
+    probeBudget,
   } = {},
 ) {
   const pid = safePid(state?.pid);
@@ -123,7 +182,7 @@ export function serviceProcessOwns(
   }
   const entrypoint = entrypointFor(state.sourceRoot);
   if (!normalized(state.commandLine).includes(entrypoint)) return false;
-  if (identity(pid, { platform }) !== state.processIdentity) return false;
-  const liveCommandLine = commandLine(pid, { platform });
+  if (identity(pid, { platform, budget: probeBudget }) !== state.processIdentity) return false;
+  const liveCommandLine = commandLine(pid, { platform, budget: probeBudget });
   return Boolean(liveCommandLine && normalized(liveCommandLine).includes(entrypoint));
 }

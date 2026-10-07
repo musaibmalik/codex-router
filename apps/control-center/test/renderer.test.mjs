@@ -37,6 +37,21 @@ const bridgeSource = String.raw`
   const staleAccountFailure = searchParams.get("staleAccountFailure") === "1";
   const staleProviderUsage = searchParams.get("staleProviderUsage") === "1";
   const fallbackUsage = searchParams.get("fallbackUsage") === "1";
+  // The usage chart walks a rolling window of UTC days ending on the current
+  // one (bucketRange in src/lib.ts), so a frozen bucket key silently ages out
+  // of the 30-day default and the bars it feeds stop rendering -- the fixture
+  // still returns the bucket, the chart just has no slot for it any more. Key
+  // these off today, in the same UTC day space the chart walks.
+  const usageDayKey = (daysAgo) => {
+    const day = new Date();
+    day.setUTCHours(12, 0, 0, 0);
+    day.setUTCDate(day.getUTCDate() - daysAgo);
+    return day.toISOString().slice(0, 10);
+  };
+  const accountUsageDay = usageDayKey(2);
+  // A distinct day from the account's, so the local router meter fills exactly
+  // one date the account stream does not cover.
+  const routerFallbackDay = usageDayKey(1);
   const pollOnceMs = Number(searchParams.get("pollOnceMs")) || 0;
   const healthPollOnceMs = Number(searchParams.get("healthPollOnceMs")) || 0;
   const staleHealth = searchParams.get("staleHealth") === "1";
@@ -141,6 +156,15 @@ const bridgeSource = String.raw`
       visionBridge: { enabled: false },
     },
   };
+  if (searchParams.get("billedRetry") === "1") {
+    target.usageEvents = [{
+      at: new Date(Date.now() - 1_000).toISOString(),
+      model: "deepseek/deepseek-chat", provider: "deepseek", status: 200,
+      inputTokens: 120, outputTokens: 35, totalTokens: 155,
+      billedInputTokens: 240, billedOutputTokens: 70,
+      emptyCompletionRetried: true,
+    }];
+  }
   const snapshot = {
     targets: { codex: target },
     catalog: {
@@ -386,7 +410,7 @@ const bridgeSource = String.raw`
           windowDurationMins: 300,
           resetsAt: 1800000000,
         },
-        dailyUsageBuckets: [{ startDate: "2026-08-27", tokens: 24000 }],
+        dailyUsageBuckets: [{ startDate: accountUsageDay, tokens: 24000 }],
         summary: { lifetimeTokens: 24000, peakDailyTokens: 24000, currentStreakDays: 1 },
       };
     },
@@ -410,7 +434,7 @@ const bridgeSource = String.raw`
             last24hTokens: 31_000,
             last24hRequests: 3,
             dailyUsageBuckets: [{
-              startDate: "2026-08-28",
+              startDate: routerFallbackDay,
               tokens: 31_000,
               requests: 3,
               inputTokens: 25_000,
@@ -430,7 +454,7 @@ const bridgeSource = String.raw`
             requests: 8,
             last24hTokens: totalTokens,
             last24hRequests: 8,
-            dailyUsageBuckets: [{ startDate: "2026-08-27", tokens: totalTokens, requests: 8 }],
+            dailyUsageBuckets: [{ startDate: accountUsageDay, tokens: totalTokens, requests: 8 }],
             account: {
               status: "available",
               metrics: [
@@ -767,6 +791,12 @@ test("the production renderer exposes model discovery and picker actions", { tim
     );
     await page.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Usage overview");
     assert.equal(await page.getByLabel("Usage source").inputValue(), "chatgpt-subscription");
+    // The tray's Settings item (Command-comma) lands on the Settings page.
+    assert.equal(
+      await page.evaluate(() => window.routerControlTest.navigate({ destination: "settings" })),
+      true,
+    );
+    await page.getByRole("heading", { name: "Settings", exact: true }).waitFor();
 
     // Harness is one client per row, in the product order the operator uses,
     // and the shared metadata index continues into Context Manager.
@@ -1181,6 +1211,35 @@ test("the production renderer exposes model discovery and picker actions", { tim
     assert.deepEqual(corruptPoolErrors, []);
     await corruptPoolPage.close();
     assert.deepEqual(pageErrors, [], `renderer errors: ${pageErrors.join("; ")}`);
+  } finally {
+    await browser.close();
+    await close();
+  }
+});
+
+test("dashboard retry totals match the billed token breakdown", { timeout: 120_000 }, async () => {
+  assert.ok(chromiumPath, "No Chromium executable is available for the Control Center renderer test.");
+  const { url, close } = await serveRenderer();
+  const browser = await chromium.launch({
+    executablePath: chromiumPath,
+    headless: true,
+    args: process.platform === "linux" ? ["--no-sandbox"] : [],
+  });
+  try {
+    const page = await newEnglishTestPage(browser);
+    page.setDefaultTimeout(10_000);
+    await page.goto(`${url}?billedRetry=1`, { waitUntil: "domcontentloaded" });
+    const eventFacts = page.locator(".db-event-metering small");
+    await eventFacts.waitFor();
+    assert.match(await eventFacts.innerText(), /310 tok/);
+    assert.match(await eventFacts.innerText(), /240 input/);
+    assert.match(await eventFacts.innerText(), /70 output/);
+    const model = page.locator(".db-breakdown-row").filter({ hasText: "deepseek-chat" });
+    assert.equal(await model.locator(".db-breakdown-value").innerText(), "310");
+    assert.match(await page.locator(".db-traffic-note").innerText(), /310/);
+    await page.getByRole("button", { name: "Status", exact: true }).click();
+    await page.locator(".st-event-metering strong").waitFor();
+    assert.match(await page.locator(".st-event-metering strong").innerText(), /310 tok/);
   } finally {
     await browser.close();
     await close();

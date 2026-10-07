@@ -644,6 +644,10 @@ The service definition still looked correct at every glance.
    That keeps caller-capability rotation/recovery from swapping generations
    underneath an unmanaged foreground router. Direct `src/start.mjs` remains the
    OS-service payload; do not route the managed service through the lifetime lock.
+   Being unmanaged, the foreground supervisor never claims the Windows
+   service-process record: `src/foreground-start.mjs` calls
+   `markForegroundSupervisor()` before it imports `src/start.mjs`, because that
+   record only accepts a command line that names `src/start.mjs`.
 3. **A silent environment adopts the recorded proxy.**
    `inheritedProxyEnvironment()` in `src/proxy-environment.mjs` reads the
    install manifest, and `src/start.mjs` applies it to `process.env` before it
@@ -661,7 +665,8 @@ The service definition still looked correct at every glance.
    normal start reaches the managed service layer, Windows matches POSIX, and
    explicit foreground startup cannot boot while another service lifecycle
    operation owns the shared lock. The same file keeps the silent-environment
-   proxy restore regression.
+   proxy restore regression. `test/startup-cleanup.test.mjs` boots the
+   foreground entry past the Windows service-process record.
 
 ## The gateway is restarted in place; the router is not taken down with it
 
@@ -733,19 +738,33 @@ and every client saw a bare "Connection error" naming nothing.
    wheel-availability floor. `scripts/verify-zai-litellm-usage.mjs` exercises
    the pinned LiteLLM bridge with synthetic authoritative usage on every Python
    lock job.
-9. **Z.ai Responses streams need a post-LiteLLM message-envelope repair.**
-   Live GLM-5.3 traffic through LiteLLM 1.96 can finish a reasoning item and
-   then emit `response.output_text.delta` for the assistant message without the
-   required `response.output_item.added` / `response.content_part.added`
-   envelope. The same malformed stream can reuse reasoning's `output_index=0`
-   for the message and close the message with a `reasoning_text` content part.
-   `src/zai-responses-compat.mjs` repairs only that Z.ai event-stream shape
-   after LiteLLM translation: valid streams remain byte-identical, native
-   OpenAI traffic is never attached to the transform, and provider reasoning
-   must never be copied into assistant-visible message content. A real Codex
-   live probe is the regression oracle: no `OutputTextDelta without active
-   item` warnings and the message occupies the next output index after
-   reasoning.
+9. **Chat Completions Responses streams need a post-LiteLLM message-envelope
+   repair.** When the first upstream chunk carries reasoning, LiteLLM 1.96
+   finishes a reasoning item and then emits `response.output_text.delta` for
+   the assistant message without the required `response.output_item.added` /
+   `response.content_part.added` envelope. It reuses the reasoning item's
+   `output_index=0` for the message and closes it with a `reasoning_text`
+   content part. In a tool turn it also closes an empty message that it never
+   opened, after the function call. First seen on Z.ai GLM-5.3. It was
+   reproduced live on OpenRouter (`mimo-v2.6-flash`,
+   `stealth/space-bunny-alpha`, 2026-09-24) and offline against the pinned
+   LiteLLM with a synthetic upstream, so the shape comes from the bridge and
+   not from any one provider.
+   `messageEnvelopeCompatTransform` in `src/zai-responses-compat.mjs` therefore
+   attaches to every `protocol: "openai"` (default) route. Exclusions: direct
+   DeepSeek, which has its own bridge repair; `openai-responses` providers,
+   which skip the bridge; and native traffic. Anthropic Messages routes are
+   excluded too, because they arrive message-first and no capture shows this
+   shape there, so widening to them needs one. Rules: an unchanged block is
+   relayed as the exact bytes that arrived. A frame that is not valid UTF-8
+   switches the stage off for the rest of the response. Content parts of an
+   item opened as something other than a message are never adopted. Provider
+   reasoning must never be copied into assistant-visible message content. The
+   regression oracle is a real Codex live probe: no `OutputTextDelta without
+   active item` errors, and the message takes the next output index after the
+   reasoning item. The router case is "router gives OpenRouter Chat
+   Completions text a message envelope after reasoning" in
+   `test/routing.test.mjs`.
 10. **LiteLLM custom-tool streaming uses a mixed lifecycle.** LiteLLM 1.96
    converts Responses `type: "custom"` tools into Chat Completions functions
    whose one required string property is `content`. On the return stream it can
@@ -2295,6 +2314,21 @@ retry rules on the shared path.
   (#840). Keep this policy shared
   between hops without applying direct DeepSeek sampling parameters to resellers.
   Command Code's schema-strict `/alpha/generate` fallback remains separate.
+- Grok OAuth is the Responses-native case of the same rule. xAI returns each
+  turn's reasoning as an opaque `encrypted_content` item, and grok-4.7 keeps
+  reasoning through a tool loop only when that item comes back. Without it the
+  model stops reasoning from about the third round, plans in visible text, and
+  can repeat one progress sentence for minutes (live A/B, 23 September 2026:
+  carried 24/24 steps reasoned; dropped or summary-only 0/18 from step 3). The
+  Chat hop through LiteLLM cannot carry the item, so
+  `src/grok-reasoning-carry.mjs` keeps a completed response's certified
+  reasoning items in the forwarder, keyed by the conversation and the call ID
+  of its first tool call, and `toResponsesRequest` puts them back in front of
+  the same calls. They are xAI's own bytes, never router-authored text. A miss
+  (restart, eviction, rewritten history) sends no reasoning, exactly as before;
+  failed or incomplete responses are never remembered.
+  `CODEX_ROUTER_GROK_REASONING_CARRY=0` turns it off. Coverage lives in
+  `test/grok-reasoning-carry.test.mjs`.
 
 Regression coverage lives in `test/deepseek-responses-routing.test.mjs`,
 `test/namespace-relay-custom.test.mjs`, `test/chat-reasoning.test.mjs` and the
@@ -2361,8 +2395,8 @@ xAI and Codex has its own idle limit. The router's post-prologue stall guard
    the forwarder's xAI pool from that one value. Compaction is a hop too: it is
    not streamed, so its headers arrive only after the whole generation, and it
    uses the same pool and deployment bound as a turn. A new hop on the Grok path
-   takes its bound from there. The shared Undici pool keeps its default for
-   every other provider.
+   takes its bound from there. Local Ollama uses its own pool sized from
+   MODEL_ROUTER_LOCAL_TIMEOUT; other providers keep the shared Undici default.
 2. **Codex's idle timer is fed a lifecycle event, never a comment.** Codex
    abandons a stream after five minutes without a parsed data event and sends
    the whole turn again, which bills the provider twice; an SSE comment or a
@@ -2372,9 +2406,16 @@ xAI and Codex has its own idle limit. The router's post-prologue stall guard
    never after a terminal event, and as the last pipeline stage so no router
    transform parses it. It never carries text, reasoning, or a tool item: the
    rule against router-authored transcript content stands.
-3. **Only Grok OAuth routes get either.** Other providers keep their stall bound
-   and receive no heartbeat. Widening either needs the same proof: a router test
-   that a silent stream survives, and one that another route is unchanged.
+3. **Only Grok OAuth gets the heartbeat.** Local Ollama gets long-idle
+   transport sized from its configured timeout without a heartbeat.
+   Z.ai Coding Plan (`zai-coding`) has its own post-reasoning idle deadline:
+   `CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS`, three minutes, capped at four
+   minutes so shared transport and client idle limits remain longer. Its
+   headers-only prelude and parser bounds are unchanged, and it receives no
+   heartbeat. Other providers keep their stall bound. Widening a route needs
+   a router test that a reasoning pause survives, one that another route is
+   unchanged, and cancellation and deadline coverage without replaying a
+   visible response.
 4. Coverage lives in `test/grok-stream-timeouts.test.mjs`,
    `test/responses-heartbeat.test.mjs`, `test/fetch-transport.test.mjs`, and the
    Grok cases in `test/empty-completion-router.test.mjs`.

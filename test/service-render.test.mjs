@@ -56,6 +56,32 @@ function render(script, platform, testRoot, target = "codex", sourceRoot = root)
   return serviceCommand(script, platform, testRoot, "render", target, sourceRoot);
 }
 
+test("all service platforms persist a bounded Z.ai idle override", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "zai-idle-service-"));
+  try {
+    for (const [platform, script] of [["darwin", "service-macos.mjs"], ["linux", "service-linux.mjs"], ["win32", "service-windows.mjs"]]) {
+      const absent = serviceCommand(script, platform, testRoot, "render", "codex", root, {
+        CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS: undefined,
+      });
+      assert.doesNotMatch(absent, /CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS/, platform);
+      for (const [setting, expected] of [["90000", "90000"], ["invalid;value", "180000"]]) {
+        const output = serviceCommand(script, platform, testRoot, "render", "codex", root, {
+          CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS: setting,
+        });
+        const expectedLine = platform === "darwin"
+          ? `<key>CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS</key>\n    <string>${expected}</string>`
+          : platform === "linux"
+            ? `Environment="CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS=${expected}"`
+            : `set "CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS=${expected}"`;
+        assert.ok(output.includes(expectedLine), `${platform}: ${expectedLine}`);
+        assert.doesNotMatch(output, /invalid;value/, platform);
+      }
+    }
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("service regeneration retains persisted hook opt-in on all platforms", () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "router-hook-service-"));
   const stateDir = path.join(testRoot, "codex router state");
@@ -166,6 +192,68 @@ test("background service definitions render for macOS, Linux, and Windows", () =
     // console code page is not UTF-8 (see service-windows.mjs).
     assert.match(windows, /set "PYTHONIOENCODING=utf-8"/);
     assert.match(windows, /set "PYTHONUTF8=1"/);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Windows service renders startup defaults unless valid operator overrides are set", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-startup-timeouts-"));
+  const settings = [
+    ["CODEX_ROUTER_VENV_PROBE_TIMEOUT_MS", "300000"],
+    ["CODEX_ROUTER_VENV_PROBE_RETRY_TIMEOUT_MS", "300000"],
+    ["CODEX_ROUTER_WINDOWS_PROCESS_PROBE_TIMEOUT_MS", "900000"],
+    ["CODEX_ROUTER_WINDOWS_PRIVATE_SYNC_TIMEOUT_MS", "900000"],
+    ["CODEX_ROUTER_STARTUP_HEALTH_TIMEOUT_MS", "300000"],
+    ["CODEX_ROUTER_GATEWAY_HEALTH_TIMEOUT_MS", "900000"],
+  ];
+  const unset = Object.fromEntries(settings.map(([name]) => [name, undefined]));
+  try {
+    const absent = serviceCommand(
+      "service-windows.mjs",
+      "win32",
+      testRoot,
+      "render",
+      "codex",
+      root,
+      unset,
+    );
+    for (const [name] of settings) {
+      assert.doesNotMatch(absent, new RegExp(`set "${name}=`), `${name} must use its consumer default`);
+    }
+
+    const configured = serviceCommand(
+      "service-windows.mjs",
+      "win32",
+      testRoot,
+      "render",
+      "codex",
+      root,
+      Object.fromEntries(settings),
+    );
+    for (const [name, value] of settings) {
+      assert.ok(configured.includes(`set "${name}=${value}"`), `${name} override was not rendered`);
+    }
+
+    for (const invalid of ["12ms", "1.5", "900001", "0"]) {
+      const rejected = serviceCommand(
+        "service-windows.mjs",
+        "win32",
+        testRoot,
+        "render",
+        "codex",
+        root,
+        {
+          ...unset,
+          CODEX_ROUTER_VENV_PROBE_TIMEOUT_MS: invalid,
+        },
+      );
+      assert.doesNotMatch(
+        rejected,
+        /set "CODEX_ROUTER_VENV_PROBE_TIMEOUT_MS=/,
+        `invalid override ${JSON.stringify(invalid)} must not be rendered`,
+      );
+    }
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }
@@ -421,9 +509,10 @@ test("the Windows scheduled task runs the VBS launcher through wscript.exe", () 
     );
 
     assert.equal(action.execute, "wscript.exe");
-    // //B and //NoLogo keep the windowless host quiet; the launcher path takes a
-    // single quote pair because wscript.exe uses the standard argument parser.
-    assert.equal(action.argument, `//B //NoLogo "${launcherPath}"`);
+    // The explicit engine keeps unrelated `.vbs` file associations from
+    // disabling the launcher. //B and //NoLogo keep the windowless host quiet;
+    // the path takes one quote pair because wscript.exe uses the standard parser.
+    assert.equal(action.argument, `//E:VBScript //B //NoLogo "${launcherPath}"`);
     // The console-visible cmd.exe action is what issue #98 reported.
     assert.doesNotMatch(`${action.execute} ${action.argument}`, /cmd\.exe/);
   } finally {
@@ -475,8 +564,8 @@ test("Windows explicit stop disables heartbeat while start and restart re-enable
 // launcher reports the parse or runtime error on stderr instead of arriving as
 // an unexplained exit code.
 const WINDOWS_SCRIPT_HOSTS = [
-  { name: "cscript.exe", args: ["//NoLogo"] },
-  { name: "wscript.exe", args: ["//B", "//NoLogo"] },
+  { name: "cscript.exe", args: ["//E:VBScript", "//NoLogo"] },
+  { name: "wscript.exe", args: ["//E:VBScript", "//B", "//NoLogo"] },
 ];
 
 // Resolved absolutely: these live in the system directory, and naming them

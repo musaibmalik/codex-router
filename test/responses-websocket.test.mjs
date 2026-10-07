@@ -226,6 +226,133 @@ function createRequest(overrides = {}) {
   };
 }
 
+test("bounds SSE events independently of HTTP chunk boundaries", async (t) => {
+  const maxEventBytes = 128;
+  const events = [
+    { type: "response.created", response: { id: "resp-budget" } },
+    ...Array.from({ length: 8 }, () => ({
+      type: "response.output_text.delta",
+      delta: "天气🌍",
+    })),
+    { type: "response.completed", response: { id: "resp-budget", output: [] } },
+  ];
+  const frames = events.map((event) => Buffer.from(`data: ${JSON.stringify(event)}\n\n`));
+  const batch = Buffer.concat(frames);
+  assert.ok(frames.every((frame) => frame.length < maxEventBytes));
+  assert.ok(batch.length > maxEventBytes);
+  const emoji = frames[1].indexOf(Buffer.from("🌍"));
+  assert.ok(emoji >= 0);
+  const cases = [
+    { name: "all events in one chunk", chunks: [batch] },
+    { name: "one chunk per event", chunks: frames },
+    {
+      name: "CRLF events in one chunk",
+      chunks: [Buffer.from(batch.toString("utf8").replaceAll("\n", "\r\n"))],
+    },
+    {
+      name: "fragmented UTF-8 followed by a batch",
+      chunks: [
+        frames[0],
+        frames[1].subarray(0, emoji + 1),
+        frames[1].subarray(emoji + 1, emoji + 3),
+        Buffer.concat([frames[1].subarray(emoji + 3), ...frames.slice(2)]),
+      ],
+    },
+  ];
+
+  for (const testCase of cases) {
+    await t.test(testCase.name, async (subtest) => {
+      let fetchCount = 0;
+      const { server, port } = await startServer(() => assert.fail("HTTP handler must not run"), {
+        maxEventBytes,
+        fetchImpl: async () => {
+          fetchCount += 1;
+          return new Response(new ReadableStream({
+            start(controller) {
+              for (const chunk of testCase.chunks) controller.enqueue(chunk);
+              controller.close();
+            },
+          }), { headers: { "content-type": "text/event-stream" } });
+        },
+      });
+      const { peer, socket } = await connect(port);
+      subtest.after(() => {
+        socket.destroy();
+        server.close();
+      });
+      peer.sendJson(createRequest());
+      for (const event of events) assert.deepEqual(await peer.nextJson(), event);
+      assert.equal(fetchCount, 1, "a batched response must not be replayed");
+    });
+  }
+});
+
+test("rejects oversized SSE lines and multiline events and cancels their body", async (t) => {
+  const maxEventBytes = 128;
+  const oversizedLine = Buffer.from(`data: ${JSON.stringify({
+    type: "response.output_text.delta",
+    delta: "界".repeat(60),
+  })}`);
+  const dataLines = JSON.stringify({
+    type: "response.output_text.delta",
+    delta: "界".repeat(30),
+  }, null, 2).split("\n");
+  const multilineChunks = [
+    ...dataLines.map((line) => Buffer.from(`data: ${line}\n`)),
+    Buffer.from("\n"),
+  ];
+  assert.ok(oversizedLine.length > maxEventBytes);
+  assert.ok(oversizedLine.toString("utf8").length < maxEventBytes);
+  assert.ok(multilineChunks.every((chunk) => chunk.length < maxEventBytes));
+  assert.ok(Buffer.byteLength(dataLines.join("\n"), "utf8") > maxEventBytes);
+  const cases = [
+    { name: "complete oversized line", chunks: [Buffer.concat([oversizedLine, Buffer.from("\n\n")])] },
+    {
+      name: "unterminated line accumulated across chunks",
+      chunks: [
+        oversizedLine.subarray(0, 96),
+        oversizedLine.subarray(96, 192),
+        oversizedLine.subarray(192),
+      ],
+    },
+    { name: "multiline event with individually bounded lines", chunks: multilineChunks },
+  ];
+
+  for (const testCase of cases) {
+    await t.test(testCase.name, async (subtest) => {
+      let canceled = false;
+      let fetchCount = 0;
+      const { server, port } = await startServer(() => assert.fail("HTTP handler must not run"), {
+        maxEventBytes,
+        fetchImpl: async () => {
+          fetchCount += 1;
+          return new Response(new ReadableStream({
+            start(controller) {
+              for (const chunk of testCase.chunks) controller.enqueue(chunk);
+              // Keep the body open: overflow must cancel, rather than wait for EOF.
+            },
+            cancel() {
+              canceled = true;
+            },
+          }), { headers: { "content-type": "text/event-stream" } });
+        },
+      });
+      const { peer, socket } = await connect(port);
+      subtest.after(() => {
+        socket.destroy();
+        server.close();
+      });
+      peer.sendJson(createRequest());
+      const error = await peer.nextJson();
+      assert.equal(error.type, "error");
+      assert.equal(error.status, 502);
+      assert.equal(error.error.type, "ERR_RESPONSES_WS_EVENT_TOO_LARGE");
+      assert.equal(canceled, true);
+      assert.equal(fetchCount, 1, "an oversized response must not be replayed");
+    });
+  }
+});
+
 test("authenticates the capability and beta contract before switching protocols", async (t) => {
   const { server, port } = await startServer(() => assert.fail("HTTP route must not run"));
   t.after(() => server.close());

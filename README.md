@@ -667,6 +667,21 @@ The Jev route is intentionally unlisted, so it cannot appear in Codex's
 conversational model picker. It is for an explicit local integration such as
 jev-pruner, never a substitute for Codex native compaction.
 
+Connecting OpenRouter makes this Decisions route available to a client that
+calls `/v1/decisions`. Do not add a Jev model in **Models** to turn on output
+pruning. In particular, OpenRouter's `typesafe/jev-router` is a conversational
+model route: selecting it changes the assistant used by Codex. It does not
+activate the hidden `openrouter-decisions/jev-latest` route or install a tool
+output hook. A Decisions client must be configured separately to call the
+endpoint; automatic Codex tool output pruning needs its own hook.
+
+If the Router goes offline during setup, use **Status → Service health → Fix**
+in Control Center, then check Router health and return to a known working chat
+model. Fix repairs and restarts the installed Router, so routed chats may be
+interrupted. It does not enable a Decisions client. See the
+[provider and model guide](docs-site/src/content/docs/reference/providers-and-models.md)
+for the general boundary between chat models and tool APIs.
+
 ### opencode (Go subscription and Zen)
 
 The opencode provider family covers both of opencode's endpoints with one
@@ -944,6 +959,7 @@ preserves Command Code's reported cached-token usage.
 
 | Picker label | Model ID |
 | --- | --- |
+| Space Bunny Alpha (Command Code) | `commandcode/stealth/space-bunny-alpha` |
 | DeepSeek V4 Flash (Command Code) | `commandcode/deepseek-v4-flash` |
 | DeepSeek V4 Pro (Command Code) | `commandcode/deepseek-v4-pro` |
 | DeepSeek V4.1 Flash (Command Code) | `commandcode/deepseek-v4.1-flash` |
@@ -1229,8 +1245,12 @@ After setup:
 3. Fully quit Codex, reopen it, and create a new task.
 4. Open the normal model picker.
 
-Codex loads `model_catalog_json` only at app startup. If models are still
-missing, run `./bin/refresh-catalog`, fully quit Codex, and reopen it.
+While the router service is running, it checks the signed-in account's native
+model catalog every five minutes and republishes changes. This lets the next
+Codex launch see newly released models without a manual catalog refresh.
+Codex loads `model_catalog_json` only at app startup. If the catalog changes
+while Codex is open, fully quit and reopen Codex to load the new list. If a
+model is still missing, run `./bin/refresh-catalog` and reopen Codex.
 
 Large compressed Codex contexts use separate safety limits for bytes received
 on the loopback socket and bytes produced after decompression. The defaults are
@@ -1632,6 +1652,13 @@ tops the list. Everything is rated against this machine's memory, anything too
 large is not offered, and anything already downloaded drops off. Add `--json`
 for the same data as an object.
 
+The local Ollama deployment uses `num_ctx: 16384` and a 600-second LiteLLM
+timeout by default. Set `MODEL_ROUTER_LOCAL_NUM_CTX` and
+`MODEL_ROUTER_LOCAL_TIMEOUT` (seconds) to positive integers in the router
+process environment to override them. The timeout applies to both streaming
+and non-streaming requests. Restart the router to regenerate its LiteLLM
+configuration after changing either value.
+
 Checking, installing, and removing are three separate actions on purpose:
 unchecking never deletes a download, and removing needs explicit confirmation.
 The `local` provider turns itself on with the first checked model and off when
@@ -1957,6 +1984,14 @@ failure. Choose the order yourself, or hand the choice back:
 ./bin/control failover chain opencode-free/big-pickle,kimi-api/kimi-k3
 ./bin/control failover auto
 ```
+
+**A route you only ever want to pick yourself can opt out.** Set
+`"failoverCandidate": false` on its entry in `user-models.json` and it stays in
+the picker and answers when you select it, but it is never chosen
+automatically -- not by quota failover, not by compaction, and not through a
+named chain. Use it for a slow, best-effort or subscription-bound route that
+must not absorb other models' traffic. Curation keeps the field on an existing
+entry; a model without it behaves exactly as before.
 
 **When a provider tells you when it will be back, that is believed.** The next
 turn skips it outright instead of paying for the same rejection again, and it

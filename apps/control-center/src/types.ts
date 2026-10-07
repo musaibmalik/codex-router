@@ -874,7 +874,7 @@ export interface RouterControlApi {
   openHarnessSession(harnessId: HarnessId, sessionId: string, surface: HarnessSurface, model?: string): Promise<unknown>;
   openExternal(url: string): Promise<void>;
   onNavigation?(listener: (request: {
-    destination: "usage" | "usage-resets";
+    destination: "usage" | "usage-resets" | "settings";
     sourceId?: string;
   }) => void): () => void;
   onOperation?(listener: (event: OperationEvent) => void): () => void;

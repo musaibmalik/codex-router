@@ -1460,6 +1460,7 @@ test("a content turn is not retried and carries no empty-completion markers", as
 
 const GROK_OAUTH_MODEL = "grok-oauth/grok-4.6";
 const GROK_API_MODEL = "grok-api/grok-4.5";
+const ZAI_CODING_MODEL = "zai-coding/glm-5.3-flash";
 const REASONING_DELTA_SSE = [
   "event: response.reasoning_text.delta",
   'data: {"type":"response.reasoning_text.delta","delta":"thinking"}',
@@ -1741,6 +1742,163 @@ test("a Grok gateway error before content reaches the client at once and only on
   } finally {
     request?.destroy();
     held?.end();
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("a Z.ai reasoning pause beyond thirty seconds still reaches response.completed", { timeout: 90_000 }, async () => {
+  let posts = 0;
+  const gw = await gateway(delayedAfterReasoning(CONTENT_SSE, 35_000, () => {
+    posts += 1;
+  }));
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "30000",
+    CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS: "",
+  });
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const result = await readRouted(routerPort, { ...TURN_BODY, model: ZAI_CODING_MODEL });
+    assert.equal(result.complete, true);
+    assert.match(result.body, /Recovered/);
+    assert.match(result.body, /event: response.completed/);
+    assert.doesNotMatch(result.body, /precontent_limit|event: error/);
+    assert.equal(posts, 1, "a visible reasoning stream is never replayed");
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 200);
+    assert.equal(event.emptyCompletionPreludeLimit, undefined);
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("the Z.ai idle override leaves another provider's stall bound intact", async () => {
+  for (const model of [ZAI_CODING_MODEL, TURN_BODY.model]) {
+    let posts = 0;
+    const upstream = upstreamOutcome();
+    const gw = await gateway(delayedAfterReasoning(CONTENT_SSE, 1_000, () => {
+      posts += 1;
+    }, upstream.settle));
+    const routerPort = await openPort();
+    const router = run({
+      ...routerEnv(gw.port, routerPort),
+      CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "25",
+      CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS: "5000",
+    });
+    try {
+      await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+      const result = await readRouted(routerPort, { ...TURN_BODY, model });
+      const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+      assert.equal(posts, 1, model);
+      if (model === ZAI_CODING_MODEL) {
+        assert.equal(await upstream.settled, "content");
+        assert.match(result.body, /event: response.completed/);
+        assert.match(result.body, /Recovered/);
+        assert.doesNotMatch(result.body, /precontent_limit|event: error/);
+        assert.equal(event.status, 200);
+      } else {
+        assert.equal(await upstream.settled, "closed");
+        assert.match(result.body, /precontent_limit/);
+        assert.doesNotMatch(result.body, /Recovered/);
+        assert.equal(event.status, 502);
+      }
+    } finally {
+      await stopChild(router);
+      await closeServer(gw.server);
+    }
+  }
+});
+
+test("Z.ai still enforces its independent idle limit without replaying reasoning", async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    writeReasoningDelta(response);
+  });
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "10000",
+    CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS: "100",
+  });
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const result = await readRouted(routerPort, { ...TURN_BODY, model: ZAI_CODING_MODEL });
+    assert.match(result.body, /precontent_limit/);
+    assert.doesNotMatch(result.body, /event: response.completed/);
+    assert.equal(posts, 1);
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 502);
+    assert.equal(event.emptyCompletionPreludeLimit, "time");
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("a Z.ai headers-only response keeps the short prelude bound", async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.flushHeaders();
+  });
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "25",
+    CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS: "180000",
+  });
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const started = Date.now();
+    const result = await readRouted(routerPort, { ...TURN_BODY, model: ZAI_CODING_MODEL });
+    assert.ok(Date.now() - started < 5_000, "no three-minute wait before any data");
+    assert.match(result.body, /precontent_limit/);
+    assert.equal(posts, 2, "only the unrelayed headers-only attempt can retry");
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 502);
+    assert.equal(event.emptyCompletionRetried, true);
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("canceling Z.ai reasoning does not wait for the longer idle deadline", async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    writeReasoningDelta(response);
+  });
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS: "180000",
+  });
+  let request;
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const base = new URL(`${callerBaseUrl(routerPort, CALLER_KEY)}/responses`);
+    await new Promise((resolve, reject) => {
+      request = http.request({
+        host: "127.0.0.1", port: routerPort, path: base.pathname, method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer codex-caller-auth" },
+      }, (response) => {
+        response.once("data", () => { request.destroy(); resolve(); });
+        response.on("error", () => {});
+      });
+      request.on("error", (error) => { if (!request.destroyed) reject(error); });
+      request.end(JSON.stringify({ ...TURN_BODY, model: ZAI_CODING_MODEL }));
+    });
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 0);
+    assert.equal(posts, 1);
+  } finally {
+    request?.destroy();
     await stopChild(router);
     await closeServer(gw.server);
   }

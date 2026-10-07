@@ -18,6 +18,7 @@ import {
   loopback,
 } from "./paths.mjs";
 import { SHUTDOWN_DRAIN_MS, SHUTDOWN_FLUSH_MS } from "./http-utils.mjs";
+import { clearStartupTimeouts, runtimeChildEnvironment, startupTimeoutMs } from "./startup-timeout.mjs";
 import { waitForHealth as pollHealth } from "./health-probe.mjs";
 import { describeChildExit, fatalExitFollowUp } from "./fatal-exit.mjs";
 import { gatewaySupervisorLimits, superviseGateway } from "./gateway-supervisor.mjs";
@@ -30,7 +31,11 @@ import { spawnableCommand } from "./spawnable-command.mjs";
 import { ensureOllamaHeadless } from "./ollama-runtime.mjs";
 import { venvRuntimeProblem } from "./venv-runtime.mjs";
 import { dependencyRepairHint } from "./dependency-repair.mjs";
-import { clearServiceProcessState, writeServiceProcessState } from "./service-process.mjs";
+import {
+  clearServiceProcessState,
+  shouldRecordServiceProcess,
+  writeServiceProcessState,
+} from "./service-process.mjs";
 import {
   environmentProxyOptedIn,
   inheritedProxyEnvironment,
@@ -245,7 +250,9 @@ function run(command, args, extraEnv = {}) {
   const spawnable = spawnableCommand(command, args);
   const child = spawn(spawnable.command, spawnable.args, {
     cwd: SOURCE_ROOT,
-    env: { ...process.env, ...commonEnv, ...extraEnv },
+    // Only this supervisor consumes startup allowances. Request handlers,
+    // diagnostic subprocesses, and restarted children keep normal runtime bounds.
+    env: runtimeChildEnvironment({ ...process.env, ...commonEnv, ...extraEnv }),
     stdio: "inherit",
     ...spawnable.options,
   });
@@ -304,6 +311,16 @@ function stopChildren() {
 const FRONTEND = { script: "router.mjs", service: "codex-router", label: "Codex router" };
 for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, stopChildren);
 
+// Boot-health allowance for spawned children (forwarders, router frontend).
+// Slow hosts (VDI Task Scheduler ancestry adds ~60 s per spawn level) raise
+// this via CODEX_ROUTER_STARTUP_HEALTH_TIMEOUT_MS; the default is unchanged.
+// The LiteLLM gateway keeps its own longer allowance below. Runtime request,
+// inference, and retry timeouts are unaffected.
+const STARTUP_CHILD_HEALTH_TIMEOUT_MS =
+  startupTimeoutMs("CODEX_ROUTER_STARTUP_HEALTH_TIMEOUT_MS", 30_000);
+const STARTUP_GATEWAY_HEALTH_TIMEOUT_MS =
+  startupTimeoutMs("CODEX_ROUTER_GATEWAY_HEALTH_TIMEOUT_MS", 300_000);
+
 async function main() {
   // These forwarders use separate ports and do not depend on one another.
   // Start all of them before waiting so a cold service does not pay their
@@ -329,7 +346,7 @@ async function main() {
       "OAuth forwarder",
       loopback(PORTS.oauth, "/health"),
       { Authorization: `Bearer ${internalKey}` },
-      30_000,
+      STARTUP_CHILD_HEALTH_TIMEOUT_MS,
       undefined,
       kimiForwarder,
     ),
@@ -337,7 +354,7 @@ async function main() {
       "API forwarder",
       loopback(PORTS.api, "/health"),
       { Authorization: `Bearer ${internalKey}` },
-      30_000,
+      STARTUP_CHILD_HEALTH_TIMEOUT_MS,
       undefined,
       api,
     ),
@@ -345,7 +362,7 @@ async function main() {
       "Grok OAuth forwarder",
       loopback(PORTS.grokOauth, "/health"),
       { Authorization: `Bearer ${internalKey}` },
-      30_000,
+      STARTUP_CHILD_HEALTH_TIMEOUT_MS,
       undefined,
       grokForwarder,
     ),
@@ -355,7 +372,7 @@ async function main() {
           "Antigravity OAuth forwarder",
           loopback(PORTS.antigravityOauth, "/health"),
           { Authorization: `Bearer ${internalKey}` },
-          30_000,
+          STARTUP_CHILD_HEALTH_TIMEOUT_MS,
           undefined,
           antigravityForwarder,
         ),
@@ -371,7 +388,7 @@ async function main() {
           "Devin CLI forwarder",
           loopback(PORTS.devinCli, "/health"),
           { Authorization: `Bearer ${internalKey}` },
-          30_000,
+          STARTUP_CHILD_HEALTH_TIMEOUT_MS,
           undefined,
           devinForwarder,
         ),
@@ -391,12 +408,15 @@ async function main() {
   // LiteLLM cold starts can take minutes when launchd starves the job under
   // system load; killing it mid-import restarts the import from scratch and
   // the service loops forever, so wait long enough for a starved import.
+  // Slow hosts (VDI Task Scheduler ancestry plus a saturated CPU) raise this
+  // via CODEX_ROUTER_GATEWAY_HEALTH_TIMEOUT_MS; the default is unchanged.
+  // This is a boot-health allowance, not an inference or request timeout.
   const gatewayHealthy = (child) =>
     waitForHealth(
       "LiteLLM gateway",
       loopback(PORTS.gateway, "/health/liveliness"),
       { Authorization: `Bearer ${internalKey}` },
-      300_000,
+      STARTUP_GATEWAY_HEALTH_TIMEOUT_MS,
       undefined,
       child,
     );
@@ -420,19 +440,10 @@ async function main() {
     frontend.label,
     loopback(PORTS.router, "/health"),
     {},
-    30_000,
+    STARTUP_CHILD_HEALTH_TIMEOUT_MS,
     frontendService,
     router,
   );
-
-  // After router is healthy, refresh the native account catalog and check its
-  // cache plus the installed Codex binary for drift in the background.
-  // This runs async without blocking further startup or waiting for user commands.
-  import("./native-catalog-drift.mjs")
-    .then(({ republishOnNativeDrift }) => republishOnNativeDrift())
-    .catch((error) => {
-      console.error(`[codex-router] Native drift check failed: ${error.message}`);
-    });
 
   if (antigravityStartup.pendingActivationGeneration) {
     const promoted = await attemptAntigravityProbePromotionAfterReadiness({
@@ -451,6 +462,23 @@ async function main() {
       );
     }
   }
+
+  // Pending activation is the last supervisor bootstrap write. Retire startup
+  // settings only after it settles, before publishers can perform runtime writes.
+  clearStartupTimeouts(process.env);
+
+  // Keep the native catalog fresh while the service is alive, including while
+  // Codex Desktop is closed, so its next startup reads newly released models.
+  // The immediate pass also handles an already stale cache after service boot.
+  import("./native-catalog-drift.mjs")
+    .then(({ republishOnNativeDrift, watchNativeCatalog }) => {
+      watchNativeCatalog();
+      return republishOnNativeDrift();
+    })
+    .catch((error) => {
+      console.error(`[codex-router] Native drift check failed: ${error.message}`);
+    });
+
   const cursorEdge = cursorInstalled
     ? run(process.execPath, [path.join(SOURCE_ROOT, "src", "cursor-public-edge.mjs")])
     : undefined;
@@ -459,7 +487,7 @@ async function main() {
       "Cursor public edge",
       loopback(PORTS.cursorPublic, "/health"),
       {},
-      30_000,
+      STARTUP_CHILD_HEALTH_TIMEOUT_MS,
       "codex-router-cursor-edge",
       cursorEdge,
     );
@@ -528,8 +556,9 @@ try {
   // cmd/node descendants still own every router port. Record the verified
   // start.mjs identity so the Windows service manager can terminate that tree
   // before it launches a replacement. Other platforms keep their native
-  // supervisor semantics and do not need this marker.
-  if (process.platform === "win32") {
+  // supervisor semantics and do not need this marker, and neither does the
+  // unmanaged foreground supervisor, which the service manager never owns.
+  if (shouldRecordServiceProcess()) {
     writeServiceProcessState();
     serviceProcessRecorded = true;
   }

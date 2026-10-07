@@ -660,6 +660,12 @@ async function relaySse(body, onEvent, { signal, maxEventBytes }) {
   let text = "";
   let dataLines = [];
   let dataChars = 0;
+  const checkLineSize = (line) => {
+    if (Buffer.byteLength(line, "utf8") <= maxEventBytes) return;
+    const error = new Error(`Responses SSE line exceeds ${maxEventBytes} bytes.`);
+    error.code = "ERR_RESPONSES_WS_EVENT_TOO_LARGE";
+    throw error;
+  };
   const dispatch = async () => {
     if (dataLines.length === 0) return true;
     const data = dataLines.join("\n");
@@ -669,6 +675,7 @@ async function relaySse(body, onEvent, { signal, maxEventBytes }) {
     return onEvent(data);
   };
   const consumeLine = async (line) => {
+    checkLineSize(line);
     if (line.endsWith("\r")) line = line.slice(0, -1);
     if (line === "") return dispatch();
     if (line.startsWith(":")) return true;
@@ -693,17 +700,15 @@ async function relaySse(body, onEvent, { signal, maxEventBytes }) {
       const { done, value } = await reader.read();
       if (done) break;
       text += decoder.decode(value, { stream: true });
-      if (Buffer.byteLength(text, "utf8") > maxEventBytes) {
-        const error = new Error(`Responses SSE line exceeds ${maxEventBytes} bytes.`);
-        error.code = "ERR_RESPONSES_WS_EVENT_TOO_LARGE";
-        throw error;
-      }
+      // An HTTP chunk can contain many bounded events. Check each complete
+      // line while consuming it, then bound only the unfinished line left over.
       let newline;
       while ((newline = text.indexOf("\n")) !== -1) {
         const line = text.slice(0, newline);
         text = text.slice(newline + 1);
         if ((await consumeLine(line)) === false) return;
       }
+      checkLineSize(text);
     }
     text += decoder.decode();
     if (text && (await consumeLine(text)) === false) return;

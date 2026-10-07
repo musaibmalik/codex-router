@@ -21,6 +21,7 @@ import {
   TARGET,
 } from "./paths.mjs";
 import { providerApiKeyServiceEnvironment } from "./provider-api-key-service-environment.mjs";
+import { serviceZaiCodingStreamEnvironment } from "./zai-stream-timeouts.mjs";
 import { serviceProxyEnvironment } from "./proxy-environment.mjs";
 import { serviceGrokPatchHookEnvironment } from "./grok-patch-hook-settings.mjs";
 import {
@@ -94,6 +95,7 @@ function environmentEntries() {
     ...serviceProxyEnvironment(),
     ...serviceGrokPatchHookEnvironment(),
     ...providerApiKeyServiceEnvironment(),
+    ...serviceZaiCodingStreamEnvironment(),
     ...(process.env.CODEX_ROUTER_SOURCE_ROOT
       ? { CODEX_ROUTER_SOURCE_ROOT: SOURCE_ROOT }
       : {}),

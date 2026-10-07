@@ -6,12 +6,21 @@
 // interpreter turns that silent failure into a checkable, fixable state.
 import { spawnSync } from "node:child_process";
 
+import { startupTimeoutMs } from "./startup-timeout.mjs";
+
 // Returns undefined when the interpreter runs, or a human-readable reason it
 // cannot. `spawn` is injectable so tests can stub it without forking.
+// Explicit timeouts win; otherwise the VDI-tunable environment applies, and
+// the shipped bounds hold when it is unset. These cover process-start latency
+// only — a fast genuine failure (ENOENT, bad exit) still reports at once.
 export function venvRuntimeProblem(
   python,
-  { spawn = spawnSync, timeoutMs = 15_000, retryTimeoutMs = 45_000 } = {},
+  { spawn = spawnSync, timeoutMs, retryTimeoutMs } = {},
 ) {
+  const firstMs = timeoutMs ??
+    startupTimeoutMs("CODEX_ROUTER_VENV_PROBE_TIMEOUT_MS", 15_000);
+  const retryMs = retryTimeoutMs ??
+    startupTimeoutMs("CODEX_ROUTER_VENV_PROBE_RETRY_TIMEOUT_MS", 45_000);
   const options = {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
@@ -26,13 +35,13 @@ export function venvRuntimeProblem(
   // real invocation fails. Isolated mode also keeps an operator's PYTHONHOME
   // or PYTHONPATH from making a healthy managed environment look damaged.
   const probeArgs = ["-I", "-c", "import encodings, sys; print(sys.prefix)"];
-  let probe = spawn(python, probeArgs, { ...options, timeout: timeoutMs });
+  let probe = spawn(python, probeArgs, { ...options, timeout: firstMs });
   if (probe.error?.code === "ETIMEDOUT") {
-    probe = spawn(python, probeArgs, { ...options, timeout: retryTimeoutMs });
+    probe = spawn(python, probeArgs, { ...options, timeout: retryMs });
   }
   if (probe.error) {
     return probe.error.code === "ETIMEDOUT"
-      ? `timed out after ${retryTimeoutMs} ms; transient process scheduling pressure is possible and this is not proof of a broken virtual environment`
+      ? `timed out after ${retryMs} ms; transient process scheduling pressure is possible and this is not proof of a broken virtual environment`
       : probe.error.message;
   }
   if (probe.status !== 0) {

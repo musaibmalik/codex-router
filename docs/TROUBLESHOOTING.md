@@ -483,6 +483,21 @@ attempt, its `upstream-terminal-failed=true` log line carries any
 provider-reported `input_tokens` and `output_tokens`; the router's usage row for
 that attempt has no token counts.
 
+Z.ai Coding Plan (`zai-coding`) reasoning streams have an independent three-minute
+idle deadline after the prologue is released. GLM can pause between reasoning
+events for more than thirty seconds, so applying the short prelude budget here
+can close a healthy turn before `response.completed`. Set
+`CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS` to an integer from `1` to `240000`
+milliseconds to override the `180000` default. Pass it when installing the
+service; the macOS, Linux, and Windows renderers persist the normalized value.
+For an existing service, set it in the launchd environment, systemd environment,
+or Windows launcher and reload that service definition; a process restart alone
+does not reload a changed launchd property list.
+Invalid values retain the default. This deadline stays below the shared transport
+and Codex client idle bounds; it adds no heartbeat. Headers-only responses retain
+the initial prelude budget, empty completions retain their guard, and a visible
+stream is never replayed. Grok's separate deadline and other routes are unchanged.
+
 Operators diagnosing an unusually slow upstream can temporarily change the
 30-second bound with `CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS` and the 1 MiB
 parser bound with `CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_BYTES`. These are

@@ -16,6 +16,8 @@ import {
   buildInterruptAgentCall,
   filterAlreadyInterrupted,
   interruptTargetFromCall,
+  isSupportedSubagentNamespace,
+  subagentToolNamespace,
 } from "./subagent-completion.mjs";
 
 // The Codex client ships most of its toolset as `type: "namespace"` entries:
@@ -649,6 +651,8 @@ function isSubagentSpawnCall(item) {
 export function injectSessionModelForSpawnCalls(item, model, effortForModel) {
   if (!isSpawnModelCall(item)) return item;
   if (typeof model !== "string" || !model) return item;
+  // Azure's plaintext handoff lets Codex honor its configured subagent model.
+  if (model.startsWith("azure-kmamc/") && isSubagentSpawnCall(item)) return item;
   if (typeof item.arguments !== "string") return item;
   if (!jsonArgumentsAreUnambiguous(item.arguments, { allowEmpty: true })) return item;
   let args;
@@ -2434,6 +2438,34 @@ function customCallIdentityMatches(source, item, lookups) {
     (item.namespace === undefined || (typeof item.namespace === "string" && Boolean(item.namespace)));
 }
 
+function markAzurePlaintextCollaborationCall(item, sessionModel) {
+  if (
+    !sessionModel?.startsWith("azure-kmamc/") ||
+    !["agents", "collaboration"].includes(item?.namespace) ||
+    !["spawn_agent", "send_message", "followup_task"].includes(item?.name) ||
+    item.encrypted_function_args !== undefined ||
+    !jsonArgumentsAreUnambiguous(item.arguments)
+  ) return item;
+  let args;
+  try {
+    args = JSON.parse(item.arguments);
+  } catch {
+    return item;
+  }
+  const message = args?.message;
+  if (typeof message !== "string" || !message || /^gAAAAA[A-Za-z0-9_-]+={0,2}$/.test(message)) {
+    return item;
+  }
+  return { ...item, encrypted_function_args: [] };
+}
+
+function restoreAzureCollaborationAlias(item, lookups, sessionModel) {
+  if (!sessionModel?.startsWith("azure-kmamc/") || item?.namespace !== "agents") return item;
+  const owners = lookups.bareToNamespaces.get(item.name);
+  if (!owners?.has("collaboration") || owners.has("agents")) return item;
+  return { ...item, namespace: "collaboration" };
+}
+
 function rewriteNamespaceFunctionCallItem(
   item,
   lookups,
@@ -2497,6 +2529,7 @@ function rewriteNamespaceFunctionCallItem(
       };
     }
   }
+  rewritten = restoreAzureCollaborationAlias(rewritten, lookups, sessionModel);
   rewritten = sanitizeSpawnAgentModel(rewritten, lookups);
   // A client may declare an ordinary function whose literal name is
   // `codex_app__create_thread`. Its request-local alias resolves back to that
@@ -2506,6 +2539,7 @@ function rewriteNamespaceFunctionCallItem(
     rewritten = injectSessionModelForSpawnCalls(rewritten, sessionModel, effortForModel);
   }
   rewritten = rewriteFunctionCallArguments(rewritten);
+  rewritten = markAzurePlaintextCollaborationCall(rewritten, sessionModel);
   return rewritten === item ? undefined : rewritten;
 }
 
@@ -2618,14 +2652,17 @@ function trackInterruptFromItem(item, interrupted) {
   if (target) interrupted.add(target);
 }
 
-function appendInterruptCallsToOutput(output, pending, interrupted) {
+function appendInterruptCallsToOutput(output, pending, interrupted, namespace) {
+  if (typeof namespace !== "string" || !namespace) {
+    return { output, injected: 0, remaining: [] };
+  }
   const remaining = filterAlreadyInterrupted(pending, interrupted);
   if (!remaining.length) return { output, injected: 0, remaining: [] };
   const base = Array.isArray(output) ? [...output] : [];
   for (const item of base) trackInterruptFromItem(item, interrupted);
   const still = filterAlreadyInterrupted(remaining, interrupted);
   for (const target of still) {
-    const call = buildInterruptAgentCall(target);
+    const call = buildInterruptAgentCall(target, { namespace });
     base.push(call);
     interrupted.add(target);
   }
@@ -2775,6 +2812,7 @@ export class NamespaceToolCallTransform extends Transform {
   #pendingInterrupts;
   #injectOnly = false;
   #interruptedTargets = new Set();
+  #interruptNamespace;
   #lastSequence = 0;
   #injectQueue = [];
   #injectionsDone = false;
@@ -2791,6 +2829,13 @@ export class NamespaceToolCallTransform extends Transform {
   constructor(namespaces, contentType = "", sessionModel, options = {}) {
     super();
     this.#lookups = buildNamespaceLookups(namespaces);
+    const toolNamespace = subagentToolNamespace(namespaces);
+    const hasToolInventory = namespaces instanceof Map && namespaces.size > 0;
+    this.#interruptNamespace =
+      toolNamespace ??
+      (!hasToolInventory && isSupportedSubagentNamespace(options.interruptNamespace)
+        ? options.interruptNamespace
+        : undefined);
     this.#sessionModel = sessionModel;
     this.#effortForModel =
       typeof options.effortForModel === "function" ? options.effortForModel : undefined;
@@ -4285,6 +4330,11 @@ export class NamespaceToolCallTransform extends Transform {
 
   #drainInterruptBlocks() {
     if (this.#injectionsDone) return [];
+    if (!this.#interruptNamespace) {
+      this.#injectionsDone = true;
+      this.#lastInjectedCalls = [];
+      return [];
+    }
     const remaining = this.#remainingInterrupts();
     if (!remaining.length) {
       this.#injectionsDone = true;
@@ -4298,7 +4348,9 @@ export class NamespaceToolCallTransform extends Transform {
       // Each transform is request-scoped, so a local counter would restart on
       // every turn and reuse call IDs that remain in Codex conversation history.
       // Use the same fresh-ID helper as the non-stream injection path instead.
-      const call = buildInterruptAgentCall(target);
+      const call = buildInterruptAgentCall(target, {
+        namespace: this.#interruptNamespace,
+      });
       this.#interruptedTargets.add(target);
       injectedCalls.push(call);
       const addedSeq = this.#lastSequence + 1;
@@ -4377,6 +4429,7 @@ export class NamespaceToolCallTransform extends Transform {
         payload.output,
         this.#pendingInterrupts,
         this.#interruptedTargets,
+        this.#interruptNamespace,
       );
       if (result.injected) payload = { ...payload, output: result.output };
     }
@@ -4388,6 +4441,7 @@ export class NamespaceToolCallTransform extends Transform {
         payload.response.output,
         this.#pendingInterrupts,
         this.#interruptedTargets,
+        this.#interruptNamespace,
       );
       if (result.injected) {
         payload = {
