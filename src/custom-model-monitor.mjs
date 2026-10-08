@@ -41,11 +41,11 @@ export async function waitForCustomModelRefresh({
         } catch { if (!signal?.aborted) log("Custom model discovery failed; retained the previous catalog."); }
       }
       if (pending && !canReload() && !foregroundNotice) {
-        log("New custom models published. Restart this foreground Router process to load their routes.");
+        log("Custom model catalog changes published. Restart this foreground Router process to load their routes.");
         foregroundNotice = true;
       }
       if (pending && !signal?.aborted && canReload() && await isIdle()) {
-        log("New custom models published; reloading the supervised routing processes while idle.");
+        log("Custom model catalog changes published; reloading the supervised routing processes while idle.");
         // start.mjs drains its owned children, then the installed OS supervisor
         // restarts the shared plane. No transaction or lock is held at this point.
         return { label: "Custom model catalog refresh", code: 0, reload: true };

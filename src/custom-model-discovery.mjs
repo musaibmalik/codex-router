@@ -8,7 +8,7 @@ import { MODELS, CHECKED_IN_MODELS, resolveProviderBaseUrl } from "./model-regis
 import { readProviderSelection } from "./provider-selection.mjs";
 import { resolveProviderCredential } from "./provider-credentials.mjs";
 import { fetchUntrustedModelCatalog, validateModelCatalogPayload } from "./untrusted-model-discovery.mjs";
-import { readUserModels, writeUserModels, userModelEntry, USER_MODELS_PATH } from "./user-models.mjs";
+import { readUserModels, writeUserModels, userModelEntry, USER_MODELS_PATH, DEFAULT_CONTEXT_WINDOW } from "./user-models.mjs";
 import { modelMetadataFromProviderRecord } from "./model-capabilities.mjs";
 import { MODEL_PICKER_STATE_PATH, readHiddenModels, readVisibleModels, setModelsVisible } from "./model-picker-state.mjs";
 import { withModelOverlayLock } from "./model-overlay-lock.mjs";
@@ -73,15 +73,72 @@ function antigravityGroup(group) {
 }
 
 function canonicalId(id, antigravity) {
-  return antigravity ? id.replace(/\((?:none|minimal|low|medium|high|xhigh|auto|\d+)\)$/i, "") : id;
+  return antigravity ? id.replace(/\((?:none|minimal|low|medium|high|xhigh|max|ultra|auto|\d+)\)$/i, "") : id;
 }
 
 function displayName(id) {
+  const claude = /^claude-(opus|sonnet)-(\d+)-(\d+)-high$/.exec(id);
+  if (claude) return `Claude ${claude[1][0].toUpperCase()}${claude[1].slice(1)} ${claude[2]}.${claude[3]} (High)`;
   return id.replace(/\(.*\)$/, "").split("-").map((part) => {
     if (part === "gpt") return "GPT";
     if (part === "oss") return "OSS";
     return part.charAt(0).toUpperCase() + part.slice(1);
   }).join(" ");
+}
+
+// Provider metadata is untrusted. An advertised completion must fit alongside
+// the input; reserve space for transport/tool overhead as well as output.
+export function customCatalogMetadata(record, { antigravity = false } = {}) {
+  const metadata = modelMetadataFromProviderRecord(record);
+  const fields = {};
+  if (metadata.displayName) fields.displayName = metadata.displayName;
+  const gemini = antigravity ? antigravityGeminiMetadata(metadata.upstreamId) : undefined;
+  if (gemini) fields.displayName = gemini.displayName;
+  const raw = record.max_completion_tokens ?? record.max_output_tokens ??
+    record.top_provider?.max_completion_tokens ?? record.top_provider?.max_output_tokens;
+  if (metadata.contextWindow || raw !== undefined) {
+    const context = metadata.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+    const output = typeof raw === "string" && /^\d+$/.test(raw) ? Number(raw) : raw;
+    if (output !== undefined && (!Number.isSafeInteger(output) || output < 1 || output + 4096 >= context)) {
+      throw new Error("Catalog completion limit leaves no safe input budget.");
+    }
+    fields.contextWindow = context;
+    fields.autoCompact = Math.min(Math.floor(context * 0.85),
+      output === undefined ? context : context - output - 4096);
+  }
+  return fields;
+}
+
+export function reconcileCustomMetadata(group, payload, { enroll = false } = {}) {
+  validateModelCatalogPayload(payload);
+  const records = Array.isArray(payload) ? payload : payload.data ?? payload.models;
+  const antigravity = antigravityGroup(group);
+  const catalog = new Map(records.map(record => [canonicalId(String(record.id ?? record.model ?? record.upstreamId ?? record.slug ?? ""), antigravity), record]));
+  const updates = [];
+  for (const model of group.models) {
+    const record = catalog.get(canonicalId(model.upstreamModel, antigravity));
+    if (!record || (!enroll && !model.customDiscoveryMetadata)) continue;
+    let fields;
+    try { fields = customCatalogMetadata(record, { antigravity }); } catch { continue; }
+    const previous = model.customDiscoveryMetadata || {};
+    const next = { ...model };
+    const owned = { ...previous };
+    const sizingOverridden = ["contextWindow", "autoCompact"].some(key =>
+      Object.hasOwn(previous, key) && model[key] !== previous[key]);
+    for (const [key, value] of Object.entries(fields)) {
+      // Context and compaction form one budget. Never apply half of an update
+      // against a user-owned sizing value from the other half.
+      if (sizingOverridden && ["contextWindow", "autoCompact"].includes(key)) continue;
+      // Enrolling a legacy entry is explicit. Once enrolled, a user edit wins.
+      if (!Object.hasOwn(previous, key) ? !enroll : model[key] !== previous[key]) continue;
+      next[key] = value;
+      owned[key] = value;
+    }
+    if (!Object.keys(owned).length) continue;
+    next.customDiscoveryMetadata = owned;
+    if (JSON.stringify(next) !== JSON.stringify(model)) updates.push(next);
+  }
+  return updates;
 }
 
 export function newCustomModels(group, payload, allModels) {
@@ -99,11 +156,12 @@ export function newCustomModels(group, payload, allModels) {
     const canonical = canonicalId(id, antigravity);
     if (known.has(canonical)) continue;
     let metadata;
-    try { metadata = modelMetadataFromProviderRecord({ ...record, id }); }
+    try { metadata = modelMetadataFromProviderRecord({ ...record, id }); customCatalogMetadata({ ...record, id }, { antigravity }); }
     catch { continue; }
     // Codex's conversation picker cannot call embedding/media-only models.
     if (metadata.outputModalities && !metadata.outputModalities.includes("text")) continue;
-    if (record.type && !["text", "chat", "model"].includes(record.type)) continue;
+    if (record.type && !["text", "chat", "model"].includes(record.type) &&
+        !(antigravity && record.type === "antigravity")) continue;
     if (/(?:^|[-_/])(?:embedding|embed|image|tts|whisper)(?:[-_/]|$)/i.test(id)) continue;
     const name = `${antigravity ? "antigravity" : "endpoint"}-${group.endpointId}-${safe(canonical)}-${digest(id).slice(0, 6)}`;
     const slug = `custom/${name}`;
@@ -114,10 +172,13 @@ export function newCustomModels(group, payload, allModels) {
       displayName: metadata.displayName || displayName(canonical),
       description: "Automatically discovered from a configured custom endpoint.",
       endpoint: group.endpoint,
-      ...(metadata.contextWindow ? { contextWindow: metadata.contextWindow, autoCompact: Math.floor(metadata.contextWindow * 0.85) } : {}),
+      ...customCatalogMetadata({ ...record, id }, { antigravity }),
       ...(metadata.inputModalities ? { inputModalities: metadata.inputModalities.filter((mode) => ["text", "image"].includes(mode)) } : {}),
       ...(antigravity ? { usesGoogleToolSchema: true, ...antigravityGeminiMetadata(canonical) } : {}),
     });
+    const owned = customCatalogMetadata({ ...record, id }, { antigravity });
+    if (Object.keys(owned).length) model.customDiscoveryMetadata = Object.fromEntries(
+      Object.keys(owned).map(key => [key, model[key]]));
     if (!model.inputModalities.length) model.inputModalities = ["text"];
     additions.push(model);
     known.add(canonical); slugs.add(slug); gateways.add(name);
@@ -127,6 +188,7 @@ export function newCustomModels(group, payload, allModels) {
 
 export async function syncCustomModels({
   apply = false,
+  reconcile = false,
   enabled = customDiscoveryEnabled,
   selected = readProviderSelection,
   allowedUrls = customDiscoveryAllowedUrls,
@@ -170,19 +232,26 @@ export async function syncCustomModels({
     const all = [...checkedIn, ...users];
     const fresh = customEndpointGroups(current(), selected(), credentialFor, allowedUrls());
     const additions = [];
+    const updates = new Map();
     for (const { group, payload } of answers) {
       const unchanged = fresh.find((candidate) => candidate.fingerprint === group.fingerprint);
       if (!unchanged) continue; // Provider disabled, endpoint changed, or key rotated while fetching.
-      try { additions.push(...newCustomModels(unchanged, payload, [...all, ...additions])); }
+      try {
+        additions.push(...newCustomModels(unchanged, payload, [...all, ...additions]));
+        for (const model of reconcileCustomMetadata(unchanged, payload, { enroll: reconcile })) {
+          if (users.some(user => user.slug === model.slug)) updates.set(model.slug, model);
+        }
+      }
       catch { failed += 1; }
     }
     const result = { changed: false, added: additions.map((model) => ({ slug: model.slug, name: model.displayName })), endpoints: groups.length, failed };
-    if (!apply || !additions.length) return result;
+    result.updated = [...updates.values()].map(model => ({slug: model.slug, name: model.displayName}));
+    if (!apply || (!additions.length && !updates.size)) return result;
     const decided = new Set([...hidden(), ...visible()]);
     await transaction({
       lock: false, files: [USER_MODELS_PATH, MODEL_PICKER_STATE_PATH],
       mutate() {
-        writeModels([...users, ...additions]);
+        writeModels([...users.map(model => updates.get(model.slug) || model), ...additions]);
         const show = additions.map((model) => model.slug).filter((slug) => !decided.has(slug));
         if (show.length) showModels(show, true);
       },
@@ -192,6 +261,6 @@ export async function syncCustomModels({
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try { console.log(JSON.stringify(await syncCustomModels({ apply: process.argv.includes("--apply") }))); }
+  try { console.log(JSON.stringify(await syncCustomModels({ apply: process.argv.includes("--apply"), reconcile: process.argv.includes("--reconcile") }))); }
   catch { console.error("Custom model synchronization failed; previous published state was retained or rollback reported an error."); process.exitCode = 1; }
 }

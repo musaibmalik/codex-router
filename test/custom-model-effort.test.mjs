@@ -107,14 +107,15 @@ test("mapping validation refuses empty, unsafe, control, and accessor model IDs"
   } })), /undeclared effort/);
 });
 
-test("Flash metadata provides one clean model name and three supported picker levels", () => {
+test("Flash metadata provides one clean model name and documented picker levels", () => {
   for (const version of ["3.6", "3.7", "3.8", "3.9", "3.10"]) {
     for (const suffix of ["", "(low)", "(medium)", "(high)"]) {
       const metadata = antigravityGeminiMetadata(`gemini-${version}-flash-high${suffix}`);
       assert.equal(metadata.displayName, `Gemini ${version} Flash`);
       assert.equal(metadata.defaultEffort, "high");
-      assert.deepEqual(metadata.reasoningLevels.map(({ effort }) => effort), ["low", "medium", "high"]);
+      assert.deepEqual(metadata.reasoningLevels.map(({ effort }) => effort), version === "3.6" ? ["minimal", "low", "medium", "high"] : ["low", "medium", "high"]);
       assert.deepEqual(metadata.upstreamModelsByEffort, {
+        ...(version === "3.6" ? {minimal: `gemini-${version}-flash-high(minimal)`} : {}),
         low: `gemini-${version}-flash-high(low)`,
         medium: `gemini-${version}-flash-high(medium)`,
         high: `gemini-${version}-flash-high(high)`,
@@ -136,11 +137,11 @@ test("Pro gateway metadata uses documented levels and preserves each base route"
   }
 });
 
-test("discovered Gemini Flash and Flash Lite have the documented three-choice selector", () => {
+test("discovered Gemini Flash and Flash Lite have the documented minimal selector", () => {
   for (const [id, name] of [["gemini-3-flash", "Gemini 3 Flash"], ["gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite"]]) {
     const metadata = antigravityGeminiMetadata(id);
     assert.equal(metadata.displayName, name);
-    assert.deepEqual(metadata.reasoningLevels.map((level) => level.effort), ["low", "medium", "high"]);
+    assert.deepEqual(metadata.reasoningLevels.map((level) => level.effort), ["minimal", "low", "medium", "high"]);
     assert.equal(metadata.upstreamModelsByEffort.medium, `${id}(medium)`);
   }
 });
@@ -148,5 +149,15 @@ test("discovered Gemini Flash and Flash Lite have the documented three-choice se
 test("metadata inference is bounded and does not reinterpret unrelated model suffixes", () => {
   for (const id of [undefined, null, {}, "gemini-4.0-flash-high", "gemini-3.8-flash", "gemini-3.8-flash-low", "gemini-3.8-flash-high(unknown)", "vendor/gemini-3.8-flash-high", "gemini-pro-agent(custom)", "claude-sonnet-4-6(high)", "gemini-3.8-flash-high(high)\n"]) {
     assert.equal(antigravityGeminiMetadata(id), undefined);
+  }
+});
+
+test("Gemini 3.5 Flash Lite supports the documented minimal effort and complete mapping", () => {
+  for (const suffix of ["", "(minimal)", "(high)"]) {
+    const metadata = antigravityGeminiMetadata(`gemini-3.5-flash-lite${suffix}`);
+    assert.equal(metadata.displayName, "Gemini 3.5 Flash Lite");
+    assert.deepEqual(metadata.reasoningLevels.map(({effort}) => effort), ["minimal", "low", "medium", "high"]);
+    assert.equal(customModelEffortProblem(gemini(metadata)), undefined);
+    assert.equal(upstreamModelForEffort(gemini(metadata), {reasoning: {effort: "minimal"}}), "gemini-3.5-flash-lite(minimal)");
   }
 });
