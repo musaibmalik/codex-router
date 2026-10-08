@@ -11,7 +11,9 @@ import { fileURLToPath } from "node:url";
 import { antigravityGeminiMetadata } from "../src/custom-model-effort.mjs";
 import { openPort } from "./port-pool.mjs";
 
-test("installed forwarder sends all three selector choices to their exact upstream model IDs", async (t) => {
+for (const upstreamId of ["gemini-3.8-flash-high", "gemini-3.5-flash-lite", "claude-sonnet-5-5-high", "unrelated-chat"]) {
+const agy = upstreamId !== "unrelated-chat";
+test(`installed forwarder sends each ${upstreamId} selector choice to its exact upstream ID`, async (t) => {
   const requests = [];
   const upstream = http.createServer(async (request, response) => {
     const chunks = []; for await (const chunk of request) chunks.push(chunk);
@@ -23,12 +25,13 @@ test("installed forwarder sends all three selector choices to their exact upstre
   const temporary = mkdtempSync(path.join(os.tmpdir(), "custom-effort-wire-"));
   const state = path.join(temporary, "state"); mkdirSync(state);
   const model = {
-    provider: "custom", slug: "custom/gemini-selector-test", gatewayModel: "gemini-selector-test",
-    upstreamModel: "gemini-3.8-flash-high(high)", listed: true, priority: 100,
-    description: "Selector wire test", contextWindow: 131072, autoCompact: 110000,
-    compHash: "selector-test-v1", inputModalities: ["text"],
+    provider: "custom", slug: agy ? "custom/antigravity-selector-test" : "custom/unrelated-selector-test", gatewayModel: "gemini-selector-test",
+    upstreamModel: `${upstreamId}(high)`, listed: true, priority: 100,
+    displayName: upstreamId, description: "Selector wire test", contextWindow: 131072, autoCompact: 110000,
+    compHash: "selector-test-v1", inputModalities: ["text"], usesGoogleToolSchema: agy,
+    reasoningLevels: [{effort: "high", description: "High"}], defaultEffort: "high",
     endpoint: { baseUrl: `http://127.0.0.1:${upstream.address().port}/v1`, keyless: true },
-    ...antigravityGeminiMetadata("gemini-3.8-flash-high"),
+    ...antigravityGeminiMetadata(upstreamId),
   };
   const modelFile = path.join(state, "user-models.json");
   writeFileSync(modelFile, JSON.stringify({ version: 1, models: [model] }), { mode: 0o600 });
@@ -57,18 +60,38 @@ test("installed forwarder sends all three selector choices to their exact upstre
     await delay(50);
   }
   assert.equal(ready, true, stderr);
-  for (const effort of ["low", "medium", "high"]) {
+  for (const {effort} of model.reasoningLevels) {
     const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
       method: "POST", headers,
       body: JSON.stringify({ model: model.gatewayModel, reasoning_effort: effort,
         messages: [{ role: "user", content: "test" }] }),
     });
     assert.equal(response.status, 200, await response.text());
-    assert.equal(requests.at(-1).model, `gemini-3.8-flash-high(${effort})`);
+    assert.equal(requests.at(-1).model, model.upstreamModelsByEffort ? `${upstreamId}(${effort})` : model.upstreamModel);
+  }
+  const tools = [{type: "function", function: {name: "do_work", parameters: {type: "object", properties: {}}}}];
+  for (const choice of ["none", {type: "none"}, "auto", "required"]) {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST", headers,
+      body: JSON.stringify({model: model.gatewayModel, messages: [{role: "user", content: "test"}], tools, tool_choice: choice}),
+    });
+    assert.equal(response.status, 200, await response.text());
+    const sent = requests.at(-1);
+    if (agy && (choice === "none" || choice.type === "none")) {
+      assert.equal(sent.tools, undefined);
+      assert.equal(sent.tool_choice, "none");
+    } else {
+      assert.equal(sent.tools.length, 1);
+      assert.deepEqual(sent.tool_choice, choice);
+    }
   }
   const before = requests.length;
   const rejected = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
     method: "POST", headers, body: JSON.stringify({ model: model.gatewayModel, reasoning_effort: "ultra", messages: [] }),
   });
-  assert.equal(rejected.status, 400); assert.equal(requests.length, before);
+  if (model.upstreamModelsByEffort) {
+    assert.equal(rejected.status, 400); assert.equal(requests.length, before);
+  } else { assert.equal(rejected.status, 200); }
 });
+
+}

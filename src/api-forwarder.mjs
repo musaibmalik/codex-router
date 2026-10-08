@@ -1268,6 +1268,15 @@ function normalizeBody(buffer, contentType, route) {
   }
 
   payload.model = upstreamModelForEffort(model, payload);
+  // AGY may invoke a declared function even when its converter sets NONE.
+  // Omit declarations as the invariant; normalize its unsupported object form.
+  if (model.provider === "custom" && model.usesGoogleToolSchema === true &&
+      model.slug.startsWith("custom/antigravity-") &&
+      (payload.tool_choice === "none" || payload.tool_choice?.type === "none")) {
+    delete payload.tools;
+    payload.tool_choice = "none";
+  }
+
   // Embeddings and Decisions have their own wire contracts. Keep every
   // provider-specific field unchanged and never send either through a chat
   // adapter or profile-specific normalisation.

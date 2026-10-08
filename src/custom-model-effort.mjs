@@ -74,28 +74,31 @@ export function upstreamModelForEffort(model, payload = {}) {
 }
 
 // This metadata is specific to Antigravity models served through CLIProxyAPI.
-// The gateway strips (low|medium|high) before routing and applies the effort:
+// The gateway strips the reasoning suffix before routing and applies the effort:
 // https://help.router-for.me/configuration/thinking
-// Its registry documents these three levels for Flash 3.6/3.7/3.8 and both
-// Pro IDs. Do not apply this suffix convention to arbitrary custom endpoints.
+// Its registry documents low/medium/high for Flash 3.6/3.7/3.8 and both
+// Pro IDs. Flash 3/3.6 and Flash Lite 3.1/3.5 also document minimal.
+// Do not apply this suffix convention to arbitrary custom endpoints.
 // https://github.com/router-for-me/CLIProxyAPI/blob/main/internal/registry/models/models.json
 export function antigravityGeminiMetadata(upstreamId) {
   if (typeof upstreamId !== "string") return undefined;
-  const match = /^(gemini-(3\.\d+)-flash-high|gemini-3-flash|gemini-3\.1-flash-lite|gemini-pro-agent|gemini-3\.1-pro-low)(?:\((low|medium|high)\))?$/.exec(upstreamId);
+  const match = /^(gemini-(3\.\d+)-flash-high|gemini-3-flash|gemini-3\.(?:1|5)-flash-lite|gemini-pro-agent|gemini-3\.1-pro-low)(?:\((minimal|low|medium|high)\))?$/.exec(upstreamId);
   if (!match) return undefined;
   const base = match[1];
   const flashVersion = match[2];
+  const efforts = ["gemini-3-flash", "gemini-3.6-flash-high", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"].includes(base)
+    ? ["minimal", ...GEMINI_EFFORTS] : GEMINI_EFFORTS;
   return {
     displayName: flashVersion ? `Gemini ${flashVersion} Flash`
       : base === "gemini-3-flash" ? "Gemini 3 Flash"
-      : base === "gemini-3.1-flash-lite" ? "Gemini 3.1 Flash Lite" : "Gemini 3.1 Pro",
-    reasoningLevels: GEMINI_EFFORTS.map((effort) => ({
+      : /^gemini-3\.(1|5)-flash-lite$/.test(base) ? `Gemini ${base.split("-")[1]} Flash Lite` : "Gemini 3.1 Pro",
+    reasoningLevels: efforts.map((effort) => ({
       effort,
       description: `${effort[0].toUpperCase()}${effort.slice(1)} reasoning effort`,
     })),
     defaultEffort: !flashVersion && base === "gemini-3.1-pro-low" ? "low" : "high",
     upstreamModelsByEffort: Object.fromEntries(
-      GEMINI_EFFORTS.map((effort) => [effort, `${base}(${effort})`]),
+      efforts.map((effort) => [effort, `${base}(${effort})`]),
     ),
   };
 }

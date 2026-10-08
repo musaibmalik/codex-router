@@ -9,7 +9,7 @@ process.env.CODEX_HOME = path.join(root, "codex");
 process.env.MODEL_ROUTER_STATE_DIR = path.join(root, "state");
 process.env.CODEX_ROUTER_NO_DISCOVERY = "0";
 process.on("exit", () => rmSync(root, { recursive: true, force: true }));
-const { customEndpointGroups, newCustomModels, syncCustomModels } = await import("../src/custom-model-discovery.mjs");
+const { customEndpointGroups, newCustomModels, syncCustomModels, customCatalogMetadata, reconcileCustomMetadata } = await import("../src/custom-model-discovery.mjs");
 const { waitForCustomModelRefresh } = await import("../src/custom-model-monitor.mjs");
 
 const seed = (name = "old", file = "endpoint.key") => ({
@@ -182,4 +182,108 @@ test("checked-in custom aliases include endpoint and credential identity", async
   assert.notEqual(modelRouteIdentity(original), modelRouteIdentity(otherKey));
   const normalized = { ...original, endpoint: { ...original.endpoint, id: "custom/alias", kind: "openai-compatible", protocol: "openai" } };
   assert.equal(modelRouteIdentity(original), modelRouteIdentity(normalized));
+});
+
+test("Antigravity catalog types, Claude names and maximum effort aliases are handled", () => {
+  const model = {...seed("antigravity-seed"), upstreamModel: "claude-opus-5-5-high(max)", usesGoogleToolSchema: true};
+  const [group] = customEndpointGroups([model], ["custom"], credentialFor);
+  const additions = newCustomModels(group, {data: [
+    {id: "claude-opus-5-5-high", type: "antigravity"},
+    {id: "claude-sonnet-5-5-high", type: "antigravity"},
+    {id: "gemini-3.5-flash-lite", type: "antigravity"},
+    {id: "media-only", type: "image"},
+  ]}, [model]);
+  assert.equal(additions.length, 2);
+  assert.equal(additions[0].displayName, "Claude Sonnet 5.5 (High)");
+  assert.equal(additions[1].upstreamModelsByEffort.minimal, "gemini-3.5-flash-lite(minimal)");
+  const [plain] = customEndpointGroups([seed()], ["custom"], credentialFor);
+  assert.equal(newCustomModels(plain, {data: [{id: "chat", type: "antigravity"}]}, [seed()]).length, 0);
+});
+
+test("discovery reserves advertised completion and transport overhead, rejecting unusable budgets", () => {
+  const sizing = customCatalogMetadata({id: "chat", context_length: 200000, max_completion_tokens: 64000});
+  assert.equal(sizing.autoCompact, 131904);
+  assert.ok(sizing.contextWindow - sizing.autoCompact >= 64000 + 4096);
+  assert.equal(customCatalogMetadata({id: "gpt-oss", context_length: 114000, max_completion_tokens: 32768}).autoCompact, 77136);
+  for (const output of [-1, 0, 1.5, "invalid", 200000]) {
+    assert.throws(() => customCatalogMetadata({id: "chat", context_length: 200000, max_completion_tokens: output}));
+  }
+});
+
+test("metadata enrollment is explicit and later user overrides survive automatic reconciliation", () => {
+  const model = {...seed(), displayName: "Old", contextWindow: 131072, autoCompact: 110000};
+  let [group] = customEndpointGroups([model], ["custom"], credentialFor);
+  const payload = {data: [{id: "old", display_name: "Current", context_length: 200000, max_completion_tokens: 64000}]};
+  assert.deepEqual(reconcileCustomMetadata(group, payload), []);
+  const [enrolled] = reconcileCustomMetadata(group, payload, {enroll: true});
+  assert.equal(enrolled.displayName, "Current");
+  assert.equal(enrolled.autoCompact, 131904);
+  const overridden = {...enrolled, displayName: "My custom name"};
+  [group] = customEndpointGroups([overridden], ["custom"], credentialFor);
+  const [updated] = reconcileCustomMetadata(group, {data: [{id: "old", display_name: "New provider name", context_length: 250000, max_completion_tokens: 64000}]});
+  assert.equal(updated.displayName, "My custom name");
+  assert.equal(updated.contextWindow, 250000);
+  assert.equal(updated.slug, model.slug);
+  assert.equal(updated.endpoint, overridden.endpoint);
+  [group] = customEndpointGroups([updated], ["custom"], credentialFor);
+  assert.deepEqual(reconcileCustomMetadata(group, {data: [{id: "old", display_name: "New provider name", context_length: 250000, max_completion_tokens: 64000}]}), []);
+  assert.deepEqual(reconcileCustomMetadata(group, {data: []}), []);
+});
+
+test("metadata-only reconciliation publishes transactionally and preserves visibility decisions", async () => {
+  const model = {...seed(), displayName: "Old", contextWindow: 131072, autoCompact: 110000};
+  const h = harness([model]);
+  h.options.reconcile = true;
+  h.options.fetchCatalog = async () => ({data: [{id: "old", display_name: "Current", context_length: 200000, max_completion_tokens: 64000}]});
+  const result = await syncCustomModels(h.options);
+  assert.equal(result.changed, true);
+  assert.equal(result.added.length, 0);
+  assert.equal(result.updated.length, 1);
+  assert.equal(h.effects.publishes, 1);
+  assert.deepEqual(h.effects.shown, []);
+  assert.equal(h.users()[0].displayName, "Current");
+  h.options.registered = h.users();
+  assert.equal((await syncCustomModels(h.options)).changed, false);
+  assert.equal(h.effects.publishes, 1);
+});
+
+test("a user override to either sizing value preserves the whole context budget", () => {
+  const baseline = {contextWindow: 200000, autoCompact: 131904, displayName: "Old"};
+  for (const overrides of [{contextWindow: 100000}, {autoCompact: 190000}]) {
+    const model = {...seed(), ...baseline, ...overrides, customDiscoveryMetadata: baseline};
+    const [group] = customEndpointGroups([model], ["custom"], credentialFor);
+    const [next] = reconcileCustomMetadata(group, {data: [{id: "old", display_name: "New", context_length: 150000, max_completion_tokens: 64000}]});
+    assert.equal(next.contextWindow, model.contextWindow);
+    assert.equal(next.autoCompact, model.autoCompact);
+    assert.equal(next.displayName, "New");
+  }
+});
+
+test("nested and output-only completion metadata retain a safe reservation", () => {
+  const nested = customCatalogMetadata({id: "chat", top_provider: {context_length: 200000, max_completion_tokens: "64000"}});
+  assert.equal(nested.autoCompact, 131904);
+  const fallback = customCatalogMetadata({id: "chat", max_completion_tokens: 64000});
+  assert.equal(fallback.contextWindow, 131072);
+  assert.equal(fallback.autoCompact, 62976);
+});
+
+test("an identical rich AGY catalog does not undo its friendly Gemini name", () => {
+  const model = {...seed("antigravity-seed"), usesGoogleToolSchema: true};
+  let [group] = customEndpointGroups([model], ["custom"], credentialFor);
+  const payload = {data: [{id: "gemini-3.8-flash-high", display_name: "Gemini 3.8 Flash High", context_length: 1048576, max_completion_tokens: 65536}]};
+  const [created] = newCustomModels(group, payload, [model]);
+  assert.equal(created.displayName, "Gemini 3.8 Flash");
+  [group] = customEndpointGroups([created], ["custom"], credentialFor);
+  assert.deepEqual(reconcileCustomMetadata(group, payload), []);
+});
+
+test("user metadata edits made during a catalog fetch survive the locked merge", async () => {
+  const model = {...seed(), displayName: "Old", customDiscoveryMetadata: {displayName: "Old"}};
+  const h = harness([model]);
+  h.options.fetchCatalog = async () => {
+    h.options.writeModels([{...h.users()[0], displayName: "My edit"}]);
+    return {data: [{id: "old", display_name: "Provider edit"}]};
+  };
+  assert.equal((await syncCustomModels(h.options)).changed, false);
+  assert.equal(h.users()[0].displayName, "My edit");
 });
